@@ -1,0 +1,755 @@
+"""End-to-end smoke test for the Simai core (no OpenClaw gateway needed).
+
+Run:  python tests/smoke_test.py
+Uses a temporary data directory; model tasks are stubbed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import yaml
+
+from simai.config import load_config
+from simai.core import backup, candidates, capture, export, qa, relations, search, tree
+from simai.core.daily import run_daily
+from simai.core.state import AppState
+from simai.crypto import keyring, sealed_inbox
+from simai.db.engine import verify_capabilities
+from simai.llm.schemas import (
+    CaptureBatchResult,
+    CaptureResult,
+    DailyExtractItem,
+    DailyExtractResult,
+    PlacementResult,
+    QueryAnswer,
+    QueryCitation,
+)
+
+PASS = "correct horse battery staple"
+
+checks: list[str] = []
+
+
+def ok(name: str, cond: bool = True) -> None:
+    if not cond:
+        print(f"FAIL {name}")
+        sys.exit(1)
+    checks.append(name)
+    print(f"  ok {name}")
+
+
+class FakeLLM:
+    """Stub for daily extraction; echoes messages as candidates."""
+
+    embedding_model = "stub-embedding"
+
+    def model_for(self, task: str) -> str:
+        return f"openclaw/stub-{task}"
+
+    def structured(self, task, system, user, schema):
+        if schema is CaptureBatchResult:
+            parts = [part.strip() for part in user.split("；") if part.strip()]
+            return CaptureBatchResult(
+                items=[
+                    CaptureResult(
+                        candidate_type="opinion",
+                        normalized_content=part,
+                        title=part[:30],
+                        proposed_action="create_root",
+                        confidence=0.9,
+                    )
+                    for part in parts
+                ]
+            )
+        if schema is PlacementResult:
+            ids = re.findall(r"N-\d{8}-[0-9a-f]+", user)
+            return PlacementResult(
+                proposed_action="create_child" if ids else "create_root",
+                proposed_parent_ids=ids[:1],
+            )
+        if schema is QueryAnswer:
+            ids = re.findall(r"N-\d{8}-[0-9a-f]+", user)
+            return QueryAnswer(
+                answer="测试回答",
+                citations=[QueryCitation(node_id=ids[0], revision_no=999, path="错误 / 路径")] if ids else [],
+            )
+        if schema is DailyExtractResult:
+            items = []
+            for message_no, line in enumerate(user.splitlines(), start=1):
+                if "] " in line:
+                    body = line.split("] ", 1)[1]
+                    if "观点" in body or "决定" in body:
+                        items.append(
+                            DailyExtractItem(
+                                source_message_no=message_no,
+                                source_excerpt=body,
+                                capture=CaptureResult(
+                                    candidate_type="opinion",
+                                    normalized_content=body,
+                                    title=body[:30],
+                                    proposed_action="create_root",
+                                    confidence=0.9,
+                                ),
+                            )
+                        )
+            return DailyExtractResult(items=items)
+        raise AssertionError(f"unexpected schema {schema}")
+
+    def embed(self, texts):
+        return [[1.0, 0.0] for _ in texts]
+
+
+def main() -> None:
+    workdir = Path(tempfile.mkdtemp(prefix="simai-test-"))
+    try:
+        run(workdir)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    print(f"\nAll {len(checks)} checks passed.")
+
+
+def run(workdir: Path) -> None:
+    data_dir = workdir / "data"
+    cfg_path = workdir / "simai.yaml"
+    cfg_path.write_text(
+        yaml.safe_dump(
+            {
+                "runtime": {"profile": "local_wsl", "data_dir": str(data_dir)},
+                "profiles": {"local_wsl": {"openclaw_gateway": "http://127.0.0.1:1"}},
+                "source_bindings": [
+                    {
+                        "id": "local_cli",
+                        "channel": "cli",
+                        "account_id": "local",
+                        "sender_key": "owner",
+                        "enabled": True,
+                        "passive_capture": True,
+                    }
+                ],
+                "daily_capture": {"cutoff_delay_minutes": 0, "max_messages_per_run": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    print("capabilities")
+    verify_capabilities()
+    ok("sqlcipher + fts5 + foreign keys present")
+
+    print("vault")
+    config = load_config(cfg_path)
+    state = AppState(config)
+    recovery = state.initialize_vault(PASS)
+    ok("vault initialized", config.key_header_path.is_file() and config.db_path.is_file())
+    ok("recovery pack returned", "vault_root_key" in recovery)
+    ok("vault header is owner-only", os.stat(config.key_header_path).st_mode & 0o777 == 0o600)
+
+    # database file must be unreadable as plain sqlite
+    import sqlite3
+
+    plain = sqlite3.connect(config.db_path)
+    try:
+        plain.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        raise AssertionError("plain sqlite could read the encrypted db!")
+    except sqlite3.DatabaseError:
+        ok("database unreadable without key")
+    finally:
+        plain.close()
+
+    state.lock()
+    try:
+        keyring.unlock_vault(config.key_header_path, "wrong password")
+        raise AssertionError("wrong passphrase accepted")
+    except keyring.WrongPassphrase:
+        ok("wrong passphrase rejected")
+    state.unlock(PASS)
+    ok("unlock with correct passphrase")
+    keys = state.keys
+
+    print("tree")
+    with state.transaction() as tx:
+        root = tree.create_node(tx, keys.audit_hmac_key, "组织管理", "关于组织管理的思考", "topic")
+        child = tree.create_node(
+            tx, keys.audit_hmac_key, "小团队自治", "小团队应当自治", "opinion", parent_id=root["node_id"]
+        )
+        grand = tree.create_node(
+            tx, keys.audit_hmac_key, "自治的边界", "自治需要边界", "idea", parent_id=child["node_id"]
+        )
+    ok("nodes created", len(tree.subtree(state.conn)) == 3)
+    with state.transaction() as tx:
+        for node_id in (root["node_id"], child["node_id"], grand["node_id"]):
+            search.upsert_embedding(tx, FakeLLM(), node_id)
+    path = tree.node_path(state.conn, grand["node_id"])
+    ok("path root→node", [p["title"] for p in path] == ["组织管理", "小团队自治", "自治的边界"])
+
+    try:
+        with state.transaction() as tx:
+            tree.move_node(tx, keys.audit_hmac_key, root["node_id"], grand["node_id"])
+        raise AssertionError("cycle move accepted")
+    except tree.TreeError:
+        ok("cycle move refused")
+
+    root_rev = state.conn.execute(
+        "SELECT current_revision_id FROM nodes WHERE id = ?", (root["node_id"],)
+    ).fetchone()[0]
+    try:
+        state.conn.execute(
+            "UPDATE nodes SET current_revision_id = ? WHERE id = ?",
+            (root_rev, child["node_id"]),
+        )
+        raise AssertionError("cross-node current_revision_id accepted")
+    except Exception:
+        ok("current_revision_id must belong to same node")
+
+    with state.transaction() as tx:
+        rel_id = relations.add_relation(
+            tx,
+            keys.audit_hmac_key,
+            grand["node_id"],
+            child["node_id"],
+            "supports",
+            origin="ai",
+            rationale="边界支撑自治",
+            confidence=0.9,
+        )
+    ok("ai relation created")
+    try:
+        with state.transaction() as tx:
+            relations.add_relation(
+                tx,
+                keys.audit_hmac_key,
+                root["node_id"],
+                child["node_id"],
+                "supersedes",
+                origin="ai",
+                confidence=0.9,
+            )
+        raise AssertionError("ai supersedes accepted")
+    except relations.RelationError:
+        ok("ai supersedes refused")
+
+    with state.transaction() as tx:
+        tree.update_node(
+            tx, keys.audit_hmac_key, child["node_id"], "revise", body="小团队应当自治，但要有边界"
+        )
+    row = state.conn.execute("SELECT state FROM relations WHERE id = ?", (rel_id,)).fetchone()
+    ok("relation stale after revise", row["state"] == "stale")
+    with state.transaction() as tx:
+        reconfirmed_id = relations.set_relation_state(tx, keys.audit_hmac_key, rel_id, "confirmed")
+    reconfirmed = state.conn.execute("SELECT * FROM relations WHERE id = ?", (reconfirmed_id,)).fetchone()
+    current_child_rev = tree.get_current_revision(state.conn, child["node_id"])
+    ok("stale relation reconfirm creates successor", reconfirmed_id != rel_id)
+    ok(
+        "reconfirmed relation binds current revision",
+        reconfirmed["to_revision_id"] == current_child_rev["id"]
+        and reconfirmed["supersedes_relation_id"] == rel_id,
+    )
+    ok("revision history kept", len(tree.revision_timeline(state.conn, child["node_id"])) == 2)
+    with state.transaction() as tx:
+        tree.move_node(tx, keys.audit_hmac_key, grand["node_id"], root["node_id"])
+        tree.update_node(tx, keys.audit_hmac_key, grand["node_id"], "revise", node_type="method")
+        tree.restore_revision(tx, keys.audit_hmac_key, grand["node_id"], 1)
+    restored_grand = tree.get_node(state.conn, grand["node_id"])
+    ok(
+        "revision restore includes parent and node type",
+        restored_grand["parent_id"] == child["node_id"] and restored_grand["node_type"] == "idea",
+    )
+    try:
+        with state.transaction() as tx:
+            tree.update_node(tx, keys.audit_hmac_key, grand["node_id"], "revise", node_type="INVALID")
+        raise AssertionError("invalid node type accepted")
+    except tree.TreeError:
+        ok("invalid updated node type refused")
+
+    with state.transaction() as tx:
+        moving_rel = relations.add_relation(
+            tx, keys.audit_hmac_key, grand["node_id"], root["node_id"], "related_to", origin="user"
+        )
+        tree.move_node(tx, keys.audit_hmac_key, grand["node_id"], root["node_id"])
+    ok(
+        "relation stale after move revision",
+        state.conn.execute("SELECT state FROM relations WHERE id = ?", (moving_rel,)).fetchone()[0]
+        == "stale",
+    )
+
+    print("candidates")
+    with state.transaction() as tx:
+        card = capture.create_raw_candidate(tx, keys.excerpt_key, "记录：产品应该聚焦单用户体验")
+    cand_id = card["candidate_id"]
+    ok("raw candidate pending", card["status"] == "pending" and card["source_excerpt"])
+    with state.transaction() as tx:
+        result = candidates.confirm_candidate(
+            tx, keys.audit_hmac_key, cand_id, action="create_child", parent_id=root["node_id"]
+        )
+    blob = state.conn.execute(
+        "SELECT source_excerpt_ciphertext FROM candidates WHERE id = ?", (cand_id,)
+    ).fetchone()[0]
+    ok("excerpt ciphertext wiped after confirm", blob is None)
+    ok("confirmed node in tree", tree.get_node(state.conn, result["node_id"])["parent_id"] == root["node_id"])
+    with state.transaction() as tx:
+        revised = capture.create_raw_candidate(tx, keys.excerpt_key, "新的正文")
+        revised_id = revised["candidate_id"]
+    with state.transaction() as tx:
+        candidates.confirm_candidate(
+            tx,
+            keys.audit_hmac_key,
+            revised_id,
+            action="revise",
+            target_node_id=result["node_id"],
+            edited_title="用户修改后的标题",
+            node_type="insight",
+        )
+    ok(
+        "revise applies edited title and node type",
+        tree.get_node(state.conn, result["node_id"])["title"] == "用户修改后的标题"
+        and tree.get_node(state.conn, result["node_id"])["node_type"] == "insight",
+    )
+
+    with state.transaction() as tx:
+        archive_parent = tree.create_node(tx, keys.audit_hmac_key, "待归档分支", "", "topic")
+        archive_child = tree.create_node(
+            tx, keys.audit_hmac_key, "待归档子项", "", parent_id=archive_parent["node_id"]
+        )
+        tree.archive_node(tx, keys.audit_hmac_key, archive_parent["node_id"])
+    archived_states = state.conn.execute(
+        "SELECT state FROM nodes WHERE id IN (?,?)",
+        (archive_parent["node_id"], archive_child["node_id"]),
+    ).fetchall()
+    ok("archiving a branch archives descendants", {row[0] for row in archived_states} == {"archived"})
+
+    try:
+        with state.transaction() as tx:
+            tree.create_node(
+                tx,
+                keys.audit_hmac_key,
+                "不应创建的子项",
+                "",
+                parent_id=archive_parent["node_id"],
+            )
+        raise AssertionError("child created below an archived parent")
+    except tree.TreeError:
+        ok("create refuses an inactive parent")
+
+    for label, operation in (
+        (
+            "update refuses an inactive target",
+            lambda tx: tree.update_node(
+                tx, keys.audit_hmac_key, archive_parent["node_id"], "revise", body="不可修改"
+            ),
+        ),
+        (
+            "move refuses an inactive target",
+            lambda tx: tree.move_node(tx, keys.audit_hmac_key, archive_parent["node_id"], None),
+        ),
+        (
+            "move refuses an inactive parent",
+            lambda tx: tree.move_node(tx, keys.audit_hmac_key, grand["node_id"], archive_parent["node_id"]),
+        ),
+        (
+            "merge refuses an inactive source",
+            lambda tx: tree.merge_nodes(tx, keys.audit_hmac_key, archive_parent["node_id"], root["node_id"]),
+        ),
+        (
+            "merge refuses an inactive target",
+            lambda tx: tree.merge_nodes(tx, keys.audit_hmac_key, root["node_id"], archive_parent["node_id"]),
+        ),
+        (
+            "archive refuses an inactive target",
+            lambda tx: tree.archive_node(tx, keys.audit_hmac_key, archive_parent["node_id"]),
+        ),
+        (
+            "revision restore refuses an inactive target",
+            lambda tx: tree.restore_revision(tx, keys.audit_hmac_key, archive_parent["node_id"], 1),
+        ),
+    ):
+        try:
+            with state.transaction() as tx:
+                operation(tx)
+            raise AssertionError(label)
+        except tree.TreeError:
+            ok(label)
+
+    try:
+        with state.transaction() as tx:
+            relations.add_relation(
+                tx,
+                keys.audit_hmac_key,
+                archive_parent["node_id"],
+                root["node_id"],
+                "related_to",
+                "user",
+            )
+        raise AssertionError("relation created with an inactive endpoint")
+    except relations.RelationError:
+        ok("relations refuse inactive endpoints")
+
+    with state.transaction() as tx:
+        restore_parent = tree.create_node(tx, keys.audit_hmac_key, "历史父节点", "", "topic")
+        restore_child = tree.create_node(
+            tx,
+            keys.audit_hmac_key,
+            "待恢复节点",
+            "第一版",
+            parent_id=restore_parent["node_id"],
+        )
+        tree.move_node(tx, keys.audit_hmac_key, restore_child["node_id"], None)
+        tree.archive_node(tx, keys.audit_hmac_key, restore_parent["node_id"])
+    try:
+        with state.transaction() as tx:
+            tree.restore_revision(tx, keys.audit_hmac_key, restore_child["node_id"], 1)
+        raise AssertionError("revision restored below an archived historical parent")
+    except tree.TreeError:
+        ok("restore refuses an inactive historical parent")
+
+    with state.transaction() as tx:
+        merge_target = tree.create_node(tx, keys.audit_hmac_key, "合并目标", "", "topic")
+        merge_source = tree.create_node(tx, keys.audit_hmac_key, "合并来源", "来源正文", "idea")
+        merge_child = tree.create_node(
+            tx,
+            keys.audit_hmac_key,
+            "合并来源的子项",
+            "",
+            parent_id=merge_source["node_id"],
+        )
+        tree.merge_nodes(tx, keys.audit_hmac_key, merge_source["node_id"], merge_target["node_id"])
+    merged_source_row = tree.get_node(state.conn, merge_source["node_id"])
+    merged_child_row = tree.get_node(state.conn, merge_child["node_id"])
+    ok(
+        "merge reparents active children before deactivating source",
+        merged_source_row["state"] == "merged"
+        and merged_child_row["state"] == "active"
+        and merged_child_row["parent_id"] == merge_target["node_id"],
+    )
+    dangling_active = state.conn.execute(
+        """SELECT c.id FROM nodes c JOIN nodes p ON p.id = c.parent_id
+           WHERE c.state = 'active' AND p.state <> 'active'"""
+    ).fetchall()
+    ok("no active node has an inactive parent", not dangling_active)
+
+    print("multi-thought capture")
+    multi_hmac = "multi-message-hmac"
+    with state.transaction() as tx:
+        multi_cards = capture.run_capture(
+            tx,
+            FakeLLM(),
+            keys.excerpt_key,
+            "观点一；观点二",
+            source_binding_id="local_cli",
+            message_hmac=multi_hmac,
+        )
+    ok("one message split into two candidates", len(multi_cards) == 2)
+    before_repeat = state.conn.execute(
+        "SELECT COUNT(*) FROM candidates WHERE message_hmac = ?", (multi_hmac,)
+    ).fetchone()[0]
+    with state.transaction() as tx:
+        repeated_cards = capture.run_capture(
+            tx,
+            FakeLLM(),
+            keys.excerpt_key,
+            "观点一；观点二",
+            source_binding_id="local_cli",
+            message_hmac=multi_hmac,
+        )
+    after_repeat = state.conn.execute(
+        "SELECT COUNT(*) FROM candidates WHERE message_hmac = ?", (multi_hmac,)
+    ).fetchone()[0]
+    ok(
+        "message-level capture remains idempotent",
+        len(repeated_cards) == 2 and before_repeat == after_repeat == 2,
+    )
+
+    print("search")
+    from simai.core.search import keyword_search
+
+    hits = keyword_search(state.conn, "自治")
+    ok("fts keyword search", any(h["node_id"] == child["node_id"] for h in hits))
+    answer = qa.answer_question(state.conn, FakeLLM(), "自治")
+    citation = answer["citations"][0]
+    expected_rev = tree.get_current_revision(state.conn, citation["node_id"])
+    ok(
+        "query citation path/revision canonicalized from database",
+        citation["revision_no"] == expected_rev["revision_no"] and citation["path"] != "错误 / 路径",
+    )
+
+    print("sealed inbox + daily")
+    pub = keyring.inbox_public_key(config.key_header_path)
+
+    def seal(body: str, message_id: str, capture_mode: str = "passive"):
+        return sealed_inbox.seal_item(
+            config.inbox_dir,
+            pub,
+            "local_cli",
+            body,
+            channel="cli",
+            account_id="local",
+            sender_key="owner",
+            conversation_id=None,
+            is_group=False,
+            message_id=message_id,
+            capture_mode=capture_mode,
+        )
+
+    seal("我的观点是备份必须常态演练", "m1")
+    seal("今天天气怎么样", "m2")
+    seal("我的观点是备份必须常态演练", "m1")  # dup
+    summary = run_daily(state, FakeLLM())
+    summary_next = run_daily(state, FakeLLM())
+    ok(
+        "daily backlog is processed in bounded batches",
+        summary["processed"] == 1 and summary["backlog_remaining"] == 1 and summary_next["processed"] == 1,
+    )
+    ok("daily extracted opinion only", summary["candidates"] + summary_next["candidates"] == 1)
+    daily_candidate = state.conn.execute(
+        """SELECT proposed_action, proposed_parent_ids FROM candidates
+           WHERE normalized_content LIKE '%备份必须常态演练%'""",
+    ).fetchone()
+    ok(
+        "daily candidate receives tree placement",
+        daily_candidate["proposed_action"] == "create_child"
+        and json.loads(daily_candidate["proposed_parent_ids"]),
+    )
+    ok("inbox emptied after commit", len(sealed_inbox.list_items(config.inbox_dir)) == 0)
+    summary2 = run_daily(state, FakeLLM())
+    ok("daily idempotent", summary2["candidates"] == 0)
+    state.daily_lock.acquire()
+    try:
+        concurrent = run_daily(state, FakeLLM())
+    finally:
+        state.daily_lock.release()
+    ok("concurrent daily run is refused", concurrent.get("already_running") is True)
+    mismatched = sealed_inbox.seal_item(
+        config.inbox_dir,
+        pub,
+        "local_cli",
+        "不应导入的错误身份",
+        channel="cli",
+        account_id="local",
+        sender_key="someone-else",
+        conversation_id=None,
+        is_group=False,
+        message_id="bad-identity",
+    )
+    mismatch_summary = run_daily(state, FakeLLM())
+    ok(
+        "daily revalidates the encrypted identity tuple",
+        mismatch_summary["refused_binding"] == 1 and mismatched.is_file(),
+    )
+    sealed_inbox.delete_item(mismatched)
+    seal("禁用时必须保留", "disabled")
+    config.raw["daily_capture"]["enabled"] = False
+    disabled_summary = run_daily(state, FakeLLM())
+    ok(
+        "daily enabled switch prevents processing",
+        disabled_summary["disabled"] and len(sealed_inbox.list_items(config.inbox_dir)) == 1,
+    )
+    config.raw["daily_capture"]["enabled"] = True
+    run_daily(state, FakeLLM())
+
+    with state.transaction() as tx:
+        snoozed = capture.create_raw_candidate(tx, keys.excerpt_key, "暂缓的想法")
+    with state.transaction() as tx:
+        candidates.snooze_candidate(tx, keys.audit_hmac_key, snoozed["candidate_id"])
+    summary3 = run_daily(state, FakeLLM())
+    ok("daily wakes snoozed candidates", summary3["woken_snoozed"] == 1 and summary3["notify"])
+    row = state.conn.execute(
+        "SELECT status FROM candidates WHERE id = ?", (snoozed["candidate_id"],)
+    ).fetchone()
+    ok("snoozed back to pending", row["status"] == "pending")
+
+    print("explicit capture skips daily")
+    import hashlib
+    import hmac as hmac_mod
+
+    seal("我的观点是主动记录过的内容不应再被每日提取", "m-explicit")
+    explicit_hmac = hmac_mod.new(
+        keys.audit_hmac_key,
+        b"local_cli|mid:m-explicit",
+        hashlib.sha256,
+    ).hexdigest()
+    pending_before = state.conn.execute(
+        "SELECT COUNT(*) FROM candidates WHERE status = 'pending'"
+    ).fetchone()[0]
+    with state.transaction() as tx:
+        capture.create_raw_candidate(
+            tx,
+            keys.excerpt_key,
+            "我的观点是主动记录过的内容不应再被每日提取",
+            source_binding_id="local_cli",
+            message_hmac=explicit_hmac,
+        )
+    summary_ex = run_daily(state, FakeLLM())
+    pending_after = state.conn.execute("SELECT COUNT(*) FROM candidates WHERE status = 'pending'").fetchone()[
+        0
+    ]
+    ok(
+        "daily skipped explicitly handled message",
+        summary_ex["skipped_already_handled"] >= 1 and summary_ex["candidates"] == 0,
+    )
+    ok("explicit capture did not yield a second daily candidate", pending_after == pending_before + 1)
+    ok("explicit inbox item removed after skip", len(sealed_inbox.list_items(config.inbox_dir)) == 0)
+
+    explicit_before = state.conn.execute(
+        "SELECT COUNT(*) FROM candidates WHERE status = 'pending'"
+    ).fetchone()[0]
+    seal("请保存这个，但它不含每日筛选关键词", "m-locked-explicit", "explicit")
+    explicit_summary = run_daily(state, FakeLLM())
+    explicit_after = state.conn.execute(
+        "SELECT COUNT(*) FROM candidates WHERE status = 'pending'"
+    ).fetchone()[0]
+    ok(
+        "sealed explicit capture always becomes a candidate",
+        explicit_summary["candidates"] == 1 and explicit_after == explicit_before + 1,
+    )
+    long_explicit_before = explicit_after
+    seal("长" * 61000, "m-long-explicit", "explicit")
+    long_explicit_summary = run_daily(state, FakeLLM())
+    long_explicit_after = state.conn.execute(
+        "SELECT COUNT(*) FROM candidates WHERE status = 'pending'"
+    ).fetchone()[0]
+    ok(
+        "explicit capture bypasses the passive model prompt-size limit",
+        long_explicit_summary["candidates"] == 1 and long_explicit_after == long_explicit_before + 1,
+    )
+    duplicate_before = long_explicit_after
+    seal("同一个消息同时经过被动观察和主动工具", "m-dual-mode", "passive")
+    seal("同一个消息同时经过被动观察和主动工具", "m-dual-mode", "explicit")
+    duplicate_summary = run_daily(state, FakeLLM())
+    duplicate_after = state.conn.execute(
+        "SELECT COUNT(*) FROM candidates WHERE status = 'pending'"
+    ).fetchone()[0]
+    ok(
+        "explicit intent wins over duplicate passive capture",
+        duplicate_summary["candidates"] == 1 and duplicate_after == duplicate_before + 1,
+    )
+
+    race_text = "我的观点是并发显式记录只能生成一个候选"
+    race_message_id = "m-race-explicit"
+    race_hmac = hmac_mod.new(
+        keys.audit_hmac_key,
+        f"local_cli|mid:{race_message_id}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    seal(race_text, race_message_id, "passive")
+    race_before = state.conn.execute("SELECT COUNT(*) FROM candidates WHERE status = 'pending'").fetchone()[0]
+
+    class ExplicitDuringDaily(FakeLLM):
+        injected = False
+
+        def structured(self, task, system, user, schema):
+            if task == "daily_extract" and not self.injected:
+                self.injected = True
+                with state.transaction() as tx:
+                    capture.create_raw_candidate(
+                        tx,
+                        keys.excerpt_key,
+                        race_text,
+                        source_binding_id="local_cli",
+                        message_hmac=race_hmac,
+                    )
+            return super().structured(task, system, user, schema)
+
+    race_summary = run_daily(state, ExplicitDuringDaily())
+    race_after = state.conn.execute("SELECT COUNT(*) FROM candidates WHERE status = 'pending'").fetchone()[0]
+    ok(
+        "daily rechecks receipts after model calls to avoid an explicit race",
+        race_summary["candidates"] == 0
+        and race_summary["skipped_already_handled"] >= 1
+        and race_after == race_before + 1,
+    )
+
+    print("export")
+    for fmt in export.FORMATS:
+        res = export.run_export(state.conn, config.export_dir, fmt)
+        ok(f"export {fmt}", Path(res["path"]).is_file() and res["nodes"] >= 4)
+    md = next(config.export_dir.glob("*.md")).read_text(encoding="utf-8")
+    ok("markdown contains node title", "组织管理" in md)
+    encrypted = export.run_export(
+        state.conn,
+        config.export_dir,
+        "markdown",
+        encryption_passphrase="export-passphrase",
+    )
+    original_name, decrypted = export.decrypt_export(
+        Path(encrypted["path"]).read_bytes(), "export-passphrase"
+    )
+    ok(
+        "password-encrypted export round trip",
+        not encrypted["plaintext"]
+        and original_name.endswith(".md")
+        and "组织管理" in decrypted.decode("utf-8"),
+    )
+    encrypted_path = Path(encrypted["path"])
+    os.utime(encrypted_path, (1, 1))
+    export.cleanup_expired(config.export_dir, 1)
+    ok("encrypted export is never TTL-deleted", encrypted_path.is_file())
+    ok(
+        "all export artifacts are owner-only",
+        all(path.stat().st_mode & 0o777 == 0o600 for path in config.export_dir.iterdir()),
+    )
+
+    print("backup")
+    seal("尚未处理的备份消息", "backup-pending")
+    result = backup.create_backup(
+        state.conn, keys.sqlcipher_hex(), config.backup_dir, config.key_header_path, config.inbox_dir
+    )
+    verify = backup.verify_restore(Path(result["backup_dir"]), keys.sqlcipher_hex())
+    ok("backup verified (incl. wrong-key rejection)", verify["ok"])
+    ok(
+        "backup manifest hashes sealed inbox files",
+        any(name.startswith("inbox/") for name in result["files"]),
+    )
+    recovery_keys = keyring.unlock_with_recovery_pack(config.key_header_path, recovery)
+    restored_dir = workdir / "restored"
+    restored = backup.restore_backup(Path(result["backup_dir"]), restored_dir, recovery_keys.sqlcipher_hex())
+    recovery_keys.wipe()
+    ok(
+        "recovery pack restores verified backup",
+        restored["ok"]
+        and (restored_dir / "simai.db").is_file()
+        and (restored_dir / config.key_header_path.name).is_file(),
+    )
+    restored_inbox = restored_dir / "inbox"
+    ok(
+        "restored data uses owner-only permissions",
+        restored_dir.stat().st_mode & 0o777 == 0o700
+        and (restored_dir / "simai.db").stat().st_mode & 0o777 == 0o600
+        and (restored_dir / config.key_header_path.name).stat().st_mode & 0o777 == 0o600
+        and restored_inbox.stat().st_mode & 0o777 == 0o700
+        and all(
+            item.stat().st_mode & 0o777 == (0o700 if item.is_dir() else 0o600)
+            for item in restored_inbox.rglob("*")
+        ),
+    )
+    manifest_path = Path(result["backup_dir"]) / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["counts"]["nodes"] += 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    try:
+        backup.verify_restore(Path(result["backup_dir"]), keys.sqlcipher_hex())
+        raise AssertionError("tampered backup manifest accepted")
+    except backup.BackupError:
+        ok("backup manifest tampering is authenticated")
+
+    keyring.change_passphrase(config.key_header_path, PASS, "new secure passphrase")
+    ok("passphrase change preserves header mode 0600", config.key_header_path.stat().st_mode & 0o777 == 0o600)
+    keyring.change_passphrase(config.key_header_path, "new secure passphrase", PASS)
+
+    print("audit & logs")
+    n_audit = state.conn.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+    ok("audit events recorded", n_audit >= 8)
+
+    state.lock()
+    ok("locked again", not state.is_unlocked)
+
+
+if __name__ == "__main__":
+    main()

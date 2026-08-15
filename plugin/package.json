@@ -1,0 +1,51 @@
+{
+  "name": "openclaw-plugin-simai",
+  "version": "0.1.0",
+  "description": "Simai (思脉) OpenClaw plugin: exact source binding, two-phase capture, encrypted inbox fallback and simai_* tools",
+  "type": "module",
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "src",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "lint": "tsc --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "libsodium-wrappers": "^0.8.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^20.14.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.7.1"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "openclaw": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "runtimeExtensions": [
+      "./dist/index.js"
+    ],
+    "install": {
+      "minHostVersion": ">=2026.7.1"
+    },
+    "compat": {
+      "pluginApi": ">=2026.7.1"
+    }
+  }
+}

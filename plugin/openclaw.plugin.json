@@ -1,0 +1,134 @@
+{
+  "id": "simai",
+  "name": "思脉",
+  "description": "将精确绑定来源的想法送入加密待确认箱，并提供思维树工具。",
+  "version": "0.1.0",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "simai_capture",
+      "simai_list_candidates",
+      "simai_confirm_candidate",
+      "simai_search",
+      "simai_get_node",
+      "simai_query",
+      "simai_status"
+    ]
+  },
+  "uiHints": {
+    "coreUrl": {
+      "label": "思脉 Core URL",
+      "help": "仅允许 Gateway 主机的 loopback URL。"
+    },
+    "coreTokenFile": {
+      "label": "插件令牌文件",
+      "help": "仅所有者可读的思脉插件令牌文件。",
+      "sensitive": true
+    },
+    "inboxSocket": {
+      "label": "加密收件箱 Socket"
+    },
+    "vaultHeaderPath": {
+      "label": "Vault 公钥头文件",
+      "help": "Socket 暂不可用时用于 sealed-box 加密，不含解密私钥。"
+    },
+    "inboxDir": {
+      "label": "密文待确认箱目录",
+      "help": "仅写入 0600 的 .sealed 密文。"
+    },
+    "correlationWindowMs": {
+      "label": "消息关联窗口（毫秒）",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "coreUrl",
+      "coreTokenFile",
+      "inboxSocket",
+      "vaultHeaderPath",
+      "inboxDir",
+      "bindings"
+    ],
+    "properties": {
+      "coreUrl": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\])(?::[0-9]+)?(?:/.*)?$"
+      },
+      "coreTokenFile": {
+        "type": "string",
+        "minLength": 1
+      },
+      "inboxSocket": {
+        "type": "string",
+        "minLength": 1
+      },
+      "vaultHeaderPath": {
+        "type": "string",
+        "minLength": 1
+      },
+      "inboxDir": {
+        "type": "string",
+        "minLength": 1
+      },
+      "correlationWindowMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 1800000
+      },
+      "bindings": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "channel",
+            "accountId",
+            "senderKey",
+            "allowGroup",
+            "passiveCapture",
+            "enabled"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "channel": {
+              "type": "string",
+              "minLength": 1
+            },
+            "accountId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "senderKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "conversationId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "allowGroup": {
+              "type": "boolean"
+            },
+            "passiveCapture": {
+              "type": "boolean"
+            },
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    }
+  }
+}

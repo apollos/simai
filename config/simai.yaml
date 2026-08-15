@@ -1,0 +1,173 @@
+runtime:
+  profile: local_wsl
+  timezone: Asia/Shanghai
+  data_dir: ~/.simai
+
+profiles:
+  local_wsl:
+    openclaw_gateway: http://127.0.0.1:18791
+    sources:
+      openclaw_web: true
+      cli: true
+      wechat: false
+
+  tencent_cloud:
+    openclaw_gateway: http://127.0.0.1:18789
+    sources:
+      openclaw_web: false
+      cli: true
+      wechat: true
+
+source_bindings:
+  - id: local_cli
+    profiles: [local_wsl]
+    enabled: true
+    channel: cli
+    account_id: local
+    sender_key: "local-owner"
+    conversation_id: "local-cli"
+    binding_key: auto_hmac
+    passive_capture: false
+    fail_closed_on_missing_identity: true
+
+  - id: local_web
+    profiles: [local_wsl]
+    # Enable only after replacing both placeholder identity values from an
+    # actual WSL OpenClaw payload probe.
+    enabled: false
+    channel: webchat
+    account_id: local
+    sender_key: "<local-owner-id>"
+    conversation_id: "<local-test-conversation>"
+    binding_key: auto_hmac
+    passive_capture: true
+    fail_closed_on_missing_identity: true
+
+  - id: yu_weixin
+    profiles: [tencent_cloud]
+    enabled: false
+    channel: openclaw-weixin
+    account_id: "<deployment-probe-result>"
+    sender_key: "<yu-from-user-id>"
+    conversation_id: "<private-conversation-id-if-present>"
+    binding_key: auto_hmac
+    allow_group: false
+    passive_capture: true
+    fail_closed_on_missing_identity: true
+
+daily_capture:
+  enabled: true
+  schedule: "30 22 * * *"
+  timezone: Asia/Shanghai
+  cutoff_delay_minutes: 30
+  process_all_unhandled: true
+  review_batch_size: 5
+  max_messages_per_run: 100
+  max_prompt_chars_per_run: 60000
+  notify_when_empty: false
+  notify_when_locked: true
+
+voice:
+  mode: existing_openclaw_pipeline
+  transcriber: qwen3.5-omni-plus
+  script_path: /home/yu/.openclaw/bin/qwen_omni_transcribe.py
+  retain_audio: false
+
+models:
+  source: openclaw
+  inherit_main_default: false
+  task_agents:
+    capture: simai
+    daily_extract: simai
+    graph_routing: simai
+    query: simai
+  embedding_model: openclaw/simai-embedding
+  # Optional Gateway bearer token (this is not a provider/model API key).
+  # The file must be a non-symlink with mode 0600.
+  gateway_token_file: null
+  # Optional backend model overrides. OpenClaw still owns provider keys and
+  # routing; values are sent via x-openclaw-model for the dedicated Agent.
+  task_models: {}
+
+normalization:
+  level: light
+  preserve_numbers: true
+  preserve_negation: true
+  preserve_conditions: true
+  preserve_uncertainty: true
+  personal_dictionary_enabled: true
+
+placement:
+  parent_candidates: 3
+  auto_commit: false
+  allow_auto_merge: false
+  allow_auto_move: false
+  allow_auto_delete: false
+
+relations:
+  auto_generate: true
+  max_per_revision: 3
+  minimum_confidence: 0.75
+  bind_to_revisions: true
+  recheck_on_revision: true
+  require_confirmation:
+    - supersedes
+    - branch_move
+    - node_merge
+
+storage:
+  engine: sqlcipher
+  store_chat_transcript: false
+  store_audio: false
+  store_embeddings_in_database: true
+  external_vector_database: false
+  encrypted_backup: true
+
+security:
+  unlock_mode: web_manual
+  key_storage: process_memory
+  kdf: argon2id
+  root_key_wrap: xchacha20_poly1305
+  key_derivation: hkdf
+  lock_on_service_restart: true
+  lock_on_web_logout: false
+  idle_auto_lock_minutes: 0
+  allow_unlock_from_wechat: false
+  allow_password_in_cli_args: false
+  plugin_token_path: ~/.simai/plugin.token
+
+sealed_inbox:
+  enabled: true
+  encryption: public_key_sealed_box
+  ingress: unix_socket
+  socket_path: ~/.simai/inbox.sock
+  atomic_write: true
+  deduplicate_by_message_hmac: true
+  retain_after_processing: false
+  warning_after_days: 7
+  hard_delete_unprocessed: false
+  max_message_bytes: 262144
+  max_queue_items: 10000
+  max_queue_bytes: 536870912
+
+web:
+  bind: 127.0.0.1
+  port: 18880
+  unlock_page_enabled: true
+  session_idle_minutes: 30
+  require_https_when_remote: true
+
+exports:
+  formats:
+    - simai-json
+    - markdown
+    - opml
+    - graphml
+    - json-canvas
+  plaintext_ttl_minutes: 30
+
+logging:
+  include_message_content: false
+  include_candidate_content: false
+  include_model_prompt: false
+  hash_source_message_ids: true

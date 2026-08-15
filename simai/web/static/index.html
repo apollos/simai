@@ -1,0 +1,763 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>思脉 Simai</title>
+<style>
+:root {
+  --bg: #0f1117; --panel: #161a23; --panel2: #1d2230; --border: #2a3040;
+  --text: #e6e9f0; --muted: #8b93a7; --accent: #5b8cff; --accent2: #7c5bff;
+  --ok: #3ecf8e; --warn: #f5a623; --bad: #ef5b5b; --radius: 10px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text); min-height: 100vh;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px;
+}
+button {
+  background: var(--accent); border: none; color: #fff; padding: 7px 14px;
+  border-radius: 7px; cursor: pointer; font-size: 13px;
+}
+button:hover { filter: brightness(1.12); }
+button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+button.danger { background: var(--bad); }
+button.small { padding: 4px 9px; font-size: 12px; }
+input, textarea, select {
+  background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 7px; padding: 8px 10px; font-size: 13px; width: 100%;
+  font-family: inherit;
+}
+textarea { resize: vertical; min-height: 70px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px;
+  background: var(--panel2); color: var(--muted); border: 1px solid var(--border); }
+.badge.ok { color: var(--ok); border-color: var(--ok); }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.badge.bad { color: var(--bad); border-color: var(--bad); }
+
+/* lock screen */
+#lockScreen {
+  position: fixed; inset: 0; background: var(--bg); display: flex;
+  align-items: center; justify-content: center; z-index: 100;
+}
+.lock-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+  padding: 40px; width: 380px; text-align: center;
+}
+.lock-card h1 { font-size: 26px; margin-bottom: 6px;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.lock-card p { color: var(--muted); margin-bottom: 22px; font-size: 13px; }
+.lock-card input { margin-bottom: 14px; text-align: center; }
+.lock-card button { width: 100%; padding: 10px; }
+#lockError { color: var(--bad); font-size: 12px; margin-top: 10px; min-height: 16px; }
+#recoveryBox { display: none; text-align: left; margin-top: 14px; background: var(--panel2);
+  border: 1px solid var(--warn); border-radius: 8px; padding: 12px; font-size: 12px; }
+#recoveryBox pre { white-space: pre-wrap; word-break: break-all; margin-top: 8px; color: var(--warn); }
+
+/* layout */
+header {
+  display: flex; align-items: center; gap: 18px; padding: 12px 22px;
+  border-bottom: 1px solid var(--border); background: var(--panel);
+  position: sticky; top: 0; z-index: 10;
+}
+header .logo { font-weight: 700; font-size: 17px;
+  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+nav { display: flex; gap: 4px; flex: 1; }
+nav button { background: transparent; color: var(--muted); border-radius: 7px; }
+nav button.active { background: var(--panel2); color: var(--text); }
+main { padding: 22px; max-width: 1200px; margin: 0 auto; }
+.panel { background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 18px; margin-bottom: 16px; }
+.panel h2 { font-size: 15px; margin-bottom: 14px; color: var(--text); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.muted { color: var(--muted); font-size: 12px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+.view { display: none; }
+.view.active { display: block; }
+
+/* inbox cards */
+.card { background: var(--panel2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px; margin-bottom: 12px; }
+.card .excerpt { color: var(--muted); font-size: 12px; border-left: 3px solid var(--border);
+  padding-left: 10px; margin: 8px 0; white-space: pre-wrap; }
+.card .content { white-space: pre-wrap; margin: 8px 0; }
+.card .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+
+/* tree */
+.tree-node { padding: 3px 0 3px 0; }
+.tree-row { display: flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
+.tree-row:hover { background: var(--panel2); }
+.tree-row .toggle { width: 18px; color: var(--muted); text-align: center; user-select: none; }
+.tree-row .type { font-size: 10px; color: var(--accent); border: 1px solid var(--border);
+  padding: 1px 5px; border-radius: 4px; }
+.tree-children { margin-left: 20px; border-left: 1px dashed var(--border); padding-left: 6px; }
+
+/* relations graph */
+#graphSvg { width: 100%; height: 480px; background: var(--panel2); border-radius: var(--radius); }
+#graphSvg text { fill: var(--text); font-size: 11px; }
+#graphSvg line.confirmed { stroke: var(--ok); }
+#graphSvg line.ai_generated { stroke: var(--accent); stroke-dasharray: 5 4; }
+#graphSvg line.stale { stroke: var(--muted); stroke-dasharray: 2 4; }
+#graphSvg circle { fill: var(--panel); stroke: var(--accent2); stroke-width: 1.5; }
+.edge-label { fill: var(--muted) !important; font-size: 10px !important; }
+
+/* QA */
+.qa-answer { white-space: pre-wrap; line-height: 1.7; }
+.citation { display: block; margin-top: 6px; color: var(--accent); font-size: 12px; cursor: pointer; }
+.inference { color: var(--warn); font-size: 12px; display: block; margin-top: 4px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+#toast { position: fixed; bottom: 24px; right: 24px; background: var(--panel);
+  border: 1px solid var(--accent); border-radius: 8px; padding: 12px 18px;
+  display: none; z-index: 200; max-width: 380px; }
+</style>
+</head>
+<body>
+
+<div id="lockScreen">
+  <div class="lock-card">
+    <h1>思脉</h1>
+    <p id="lockHint">输入口令解锁你的思想树</p>
+    <input type="password" id="passphrase" placeholder="口令" autocomplete="current-password"
+           onkeydown="if(event.key==='Enter')doUnlock()">
+    <input type="password" id="passphraseConfirm" placeholder="再次输入口令"
+           autocomplete="new-password" style="display:none;margin-top:8px">
+    <button onclick="doUnlock()" id="unlockBtn">解锁</button>
+    <div id="lockError"></div>
+    <div id="recoveryBox">
+      <b>一次性离线恢复包（只显示这一次，请立即保存到安全的离线位置）：</b>
+      <pre id="recoveryText"></pre>
+      <button class="small" style="margin-top:8px" onclick="downloadRecovery()">下载恢复包</button>
+    </div>
+  </div>
+</div>
+
+<header style="display:none" id="topbar">
+  <span class="logo">思脉</span>
+  <nav id="nav">
+    <button data-view="inbox" class="active">待确认箱 <span class="badge" id="pendingBadge">0</span></button>
+    <button data-view="tree">思维树</button>
+    <button data-view="node">节点详情</button>
+    <button data-view="graph">关系视图</button>
+    <button data-view="search">搜索与问答</button>
+    <button data-view="settings">配置与状态</button>
+  </nav>
+  <span class="badge ok" id="lockState">已解锁</span>
+  <button class="ghost small" onclick="doLock()">锁定</button>
+</header>
+
+<main style="display:none" id="mainArea">
+
+  <!-- 待确认箱 -->
+  <section class="view active" id="view-inbox">
+    <div class="panel">
+      <h2>主动记录</h2>
+      <div class="row">
+        <textarea id="captureText" placeholder="记录一下……（将由 simai Agent 轻度整理并推荐挂载位置）" style="flex:1"></textarea>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button onclick="doCapture(true)">整理并生成候选</button>
+        <button class="ghost" onclick="doCapture(false)">按原文生成候选（不调用模型）</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>待确认候选 <span class="muted">（确认后才会写入正式思维树）</span></h2>
+      <div class="row" style="margin-bottom:10px">
+        <button class="small" onclick="batchCandidates('confirm')">批量确认选中项</button>
+        <button class="small ghost" onclick="batchCandidates('snooze')">批量暂缓</button>
+        <button class="small danger" onclick="batchCandidates('reject')">批量拒绝</button>
+      </div>
+      <div id="inboxList"><p class="muted">加载中…</p></div>
+    </div>
+  </section>
+
+  <!-- 思维树 -->
+  <section class="view" id="view-tree">
+    <div class="panel">
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">思维树</h2>
+        <div class="row">
+          <button class="small" onclick="promptNewRoot()">新建一级主题</button>
+          <button class="ghost small" onclick="loadTree()">刷新</button>
+        </div>
+      </div>
+      <div id="treeRoot" style="margin-top:14px"><p class="muted">加载中…</p></div>
+    </div>
+  </section>
+
+  <!-- 节点详情 -->
+  <section class="view" id="view-node">
+    <div class="panel" id="nodeDetail"><p class="muted">从思维树或搜索结果中选择一个节点。</p></div>
+  </section>
+
+  <!-- 关系视图 -->
+  <section class="view" id="view-graph">
+    <div class="panel">
+      <div class="row">
+        <input id="graphNodeId" placeholder="节点 ID（如 N-20260814-xxxx）" style="width:280px">
+        <select id="graphDepth" style="width:90px">
+          <option value="1">1 跳</option><option value="2">2 跳</option>
+        </select>
+        <button onclick="loadGraph()">显示局部关系图</button>
+        <span class="muted">实线 = 用户确认；虚线 = AI 生成待确认</span>
+      </div>
+      <svg id="graphSvg" style="margin-top:14px"></svg>
+      <div id="graphEdges" style="margin-top:10px"></div>
+    </div>
+  </section>
+
+  <!-- 搜索与问答 -->
+  <section class="view" id="view-search">
+    <div class="grid2">
+      <div class="panel">
+        <h2>搜索（关键词 + 语义）</h2>
+        <div class="row">
+          <input id="searchQ" placeholder="搜索节点…" onkeydown="if(event.key==='Enter')doSearch()">
+          <button onclick="doSearch()">搜索</button>
+        </div>
+        <div id="searchResults" style="margin-top:12px"></div>
+      </div>
+      <div class="panel">
+        <h2>自然语言问答</h2>
+        <div class="row">
+          <input id="queryQ" placeholder="例如：我对组织管理的核心观点是什么？" onkeydown="if(event.key==='Enter')doQuery()">
+          <button onclick="doQuery()">提问</button>
+        </div>
+        <div id="queryResult" style="margin-top:12px"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 配置与状态 -->
+  <section class="view" id="view-settings">
+    <div class="grid2">
+      <div class="panel">
+        <h2>运行状态</h2>
+        <div id="statusBox" class="muted">加载中…</div>
+        <div class="row" style="margin-top:12px">
+          <button class="small" onclick="runDaily()">立即运行每日提取</button>
+          <button class="small ghost" onclick="checkModels()">测试模型健康</button>
+          <button class="small ghost" onclick="doBackup()">创建加密备份</button>
+        </div>
+        <div id="modelHealth" style="margin-top:10px"></div>
+      </div>
+      <div class="panel">
+        <h2>导出</h2>
+        <div class="row">
+          <select id="exportFormat" style="width:160px">
+            <option value="simai-json">simai.json</option>
+            <option value="markdown">Markdown</option>
+            <option value="opml">OPML</option>
+            <option value="graphml">GraphML</option>
+            <option value="json-canvas">JSON Canvas</option>
+          </select>
+          <input id="exportRoot" placeholder="子树根节点 ID（留空为整棵树）" style="width:260px">
+          <label class="muted"><input type="checkbox" id="exportHistory" style="width:auto"> 包含历史版本</label>
+          <label class="muted"><input type="checkbox" id="exportAiRel" checked style="width:auto"> 包含 AI 关系</label>
+          <input type="password" id="exportPassword" placeholder="可选：导出包口令（至少 8 位）" style="width:240px">
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button onclick="doExport()">导出</button>
+        </div>
+        <div id="exportResult" style="margin-top:10px"></div>
+      </div>
+      <div class="panel">
+        <h2>来源白名单</h2>
+        <div id="bindingsBox" class="muted">加载中…</div>
+      </div>
+      <div class="panel">
+        <h2>个人词典</h2>
+        <div class="row">
+          <input id="dictTerm" placeholder="专有名词 / 常见 ASR 纠错词" style="width:220px">
+          <input id="dictNote" placeholder="备注（可选）" style="width:220px">
+          <button class="small" onclick="addDictionaryTerm()">添加</button>
+        </div>
+        <div id="dictionaryBox" style="margin-top:10px"></div>
+      </div>
+      <div class="panel">
+        <h2>最近定时任务</h2>
+        <div id="jobsBox" class="muted">加载中…</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let currentNodeId = null;
+let recoveryPack = null;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (r.status === 401) { showLock("会话已过期，请重新登录（数据库保持解锁）"); throw new Error("401"); }
+  if (r.status === 423) { showLock("思脉处于锁定状态"); throw new Error("423"); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.detail || r.statusText);
+  return data;
+}
+function toast(msg, ms = 3200) {
+  const t = $("#toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", ms);
+}
+function esc(s) { return (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+/* ---------- lock / unlock ---------- */
+function showLock(hint) {
+  $("#lockScreen").style.display = "flex";
+  $("#topbar").style.display = "none";
+  $("#mainArea").style.display = "none";
+  if (hint) $("#lockHint").textContent = hint;
+}
+function showApp() {
+  recoveryPack = null;
+  $("#recoveryText").textContent = "";
+  $("#recoveryBox").style.display = "none";
+  $("#lockScreen").style.display = "none";
+  $("#topbar").style.display = "flex";
+  $("#mainArea").style.display = "block";
+  refreshAll();
+}
+async function boot() {
+  const st = await fetch("/api/status").then(r => r.json());
+  if (!st.initialized) {
+    $("#lockHint").textContent = "首次使用：设置口令并初始化加密保险库（至少 8 位）";
+    $("#unlockBtn").textContent = "初始化";
+    $("#unlockBtn").onclick = doInit;
+    $("#passphrase").autocomplete = "new-password";
+    $("#passphraseConfirm").style.display = "block";
+  }
+}
+async function doInit() {
+  try {
+    if ($("#passphrase").value !== $("#passphraseConfirm").value)
+      throw new Error("两次输入的口令不一致");
+    const d = await api("/api/init", { method: "POST", body: { passphrase: $("#passphrase").value } });
+    $("#passphrase").value = "";
+    $("#passphraseConfirm").value = "";
+    recoveryPack = d.recovery_pack;
+    $("#recoveryText").textContent = JSON.stringify(d.recovery_pack, null, 2);
+    $("#recoveryBox").style.display = "block";
+    $("#unlockBtn").textContent = "我已保存恢复包，进入思脉";
+    $("#unlockBtn").onclick = showApp;
+    $("#lockError").textContent = "";
+  } catch (e) { $("#lockError").textContent = e.message; }
+}
+function downloadRecovery() {
+  const blob = new Blob([JSON.stringify(recoveryPack, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  const url = URL.createObjectURL(blob);
+  a.href = url; a.download = "simai-recovery-pack.json"; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+async function doUnlock() {
+  $("#lockError").textContent = "";
+  try {
+    const d = await api("/api/unlock", { method: "POST", body: { passphrase: $("#passphrase").value } });
+    $("#passphrase").value = "";
+    if (d.backlog_processed && d.backlog_processed.candidates > 0)
+      toast(`解锁成功，已补处理积压密文，生成 ${d.backlog_processed.candidates} 条候选`);
+    showApp();
+  } catch (e) {
+    $("#lockError").textContent = e.message;
+  }
+}
+async function doLock() {
+  await api("/api/lock", { method: "POST" });
+  showLock("思脉已锁定");
+}
+
+/* ---------- navigation ---------- */
+$("#nav").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button"); if (!btn) return;
+  document.querySelectorAll("#nav button").forEach(b => b.classList.remove("active"));
+  btn.classList.add("active");
+  document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+  $("#view-" + btn.dataset.view).classList.add("active");
+});
+function gotoView(name) {
+  document.querySelector(`#nav button[data-view="${name}"]`).click();
+}
+
+async function refreshAll() {
+  loadInbox(); loadTree(); loadStatus(); loadConfig(); loadJobs(); loadDictionary();
+}
+
+/* ---------- inbox ---------- */
+async function doCapture(useModel) {
+  const text = $("#captureText").value.trim();
+  if (!text) return;
+  try {
+    await api("/api/capture", { method: "POST", body: { text, use_model: useModel } });
+    $("#captureText").value = "";
+    toast("候选已生成，请在下方确认");
+    loadInbox();
+  } catch (e) { toast("生成失败：" + e.message, 6000); }
+}
+async function loadInbox() {
+  try {
+    const [d, treeData] = await Promise.all([api("/api/candidates"), api("/api/tree")]);
+    const allParents = treeData.nodes.map(n =>
+      `<option value="${n.id}">${esc(n.title)} (${esc(n.id)})</option>`).join("");
+    $("#pendingBadge").textContent = d.candidates.length;
+    if (!d.candidates.length) { $("#inboxList").innerHTML = '<p class="muted">没有待确认的候选。</p>'; return; }
+    $("#inboxList").innerHTML = d.candidates.map(c => `
+      <div class="card" id="cand-${c.candidate_id}">
+        <div class="row" style="justify-content:space-between">
+          <span><input type="checkbox" class="candidate-select" value="${c.candidate_id}" style="width:auto">
+          <b>${esc(c.title)}</b></span>
+          <span>
+            <span class="badge">${esc(c.candidate_type)}</span>
+            <span class="badge warn">${esc(c.proposed_action)}</span>
+            ${c.needs_clarification ? '<span class="badge bad">需澄清</span>' : ""}
+          </span>
+        </div>
+        ${c.source_excerpt ? `<div class="excerpt">原文：${esc(c.source_excerpt)}</div>` : ""}
+        <div class="row">
+          <input id="title-${c.candidate_id}" value="${esc(c.title)}" style="flex:1">
+          <select id="type-${c.candidate_id}" style="width:150px">
+            ${["idea","opinion","decision","question","principle","hypothesis","insight","risk","method","topic"]
+              .map(t => `<option value="${t}" ${t === c.candidate_type ? "selected" : ""}>${t}</option>`).join("")}
+          </select>
+        </div>
+        <textarea id="content-${c.candidate_id}">${esc(c.normalized_content)}</textarea>
+        <div class="row" style="margin-top:8px">
+          <span class="muted">挂载：</span>
+          <select id="parent-${c.candidate_id}" style="width:340px">
+            <option value="" ${c.proposed_action === "create_root" ? "selected" : ""}>（新建一级主题）</option>
+            ${c.proposed_parents.map((p, i) => `<option value="${p.node_id}" ${i === 0 && c.proposed_action !== "create_root" ? "selected" : ""}>${esc(p.path)}（推荐）</option>`).join("")}
+            ${allParents}
+          </select>
+          <select id="action-${c.candidate_id}" style="width:150px">
+            ${["create_root","create_child","append","revise"].map(a =>
+              `<option value="${a}" ${a === c.proposed_action ? "selected" : ""}>${a}</option>`).join("")}
+          </select>
+        </div>
+        <div class="actions">
+          <button class="small" onclick="confirmCand('${c.candidate_id}')">确认写入</button>
+          <button class="small ghost" onclick="snoozeCand('${c.candidate_id}')">暂缓</button>
+          <button class="small danger" onclick="rejectCand('${c.candidate_id}')">拒绝</button>
+        </div>
+      </div>`).join("");
+  } catch (e) { /* locked or session expired: handled globally */ }
+}
+function candidateDecisionBody(id) {
+  const parent = $(`#parent-${id}`).value || null;
+  let action = $(`#action-${id}`).value || null;
+  if (!action) action = parent ? "create_child" : "create_root";
+  return {
+    action,
+    parent_id: (action === "create_child") ? parent : null,
+    target_node_id: (action === "append" || action === "revise") ? parent : null,
+    edited_title: $(`#title-${id}`).value,
+    edited_content: $(`#content-${id}`).value,
+    node_type: $(`#type-${id}`).value,
+  };
+}
+async function confirmCand(id) {
+  try {
+    const r = await api(`/api/candidates/${id}/confirm`, {
+      method: "POST", body: candidateDecisionBody(id)
+    });
+    toast("已写入思维树：" + r.node_id);
+    loadInbox(); loadTree();
+  } catch (e) { toast("确认失败：" + e.message, 6000); }
+}
+async function rejectCand(id) { await api(`/api/candidates/${id}/reject`, { method: "POST" }); loadInbox(); }
+async function snoozeCand(id) { await api(`/api/candidates/${id}/snooze`, { method: "POST" }); loadInbox(); }
+async function batchCandidates(action) {
+  const ids = [...document.querySelectorAll(".candidate-select:checked")].map(x => x.value);
+  if (!ids.length) { toast("请先选择候选"); return; }
+  if (action === "reject" && !confirm(`拒绝选中的 ${ids.length} 条候选？`)) return;
+  try {
+    const decisions = action === "confirm"
+      ? ids.map(id => [id, candidateDecisionBody(id)]) : [];
+    for (const id of ids) {
+      if (action === "confirm") {
+        const body = decisions.find(([candidateId]) => candidateId === id)[1];
+        await api(`/api/candidates/${id}/confirm`, { method: "POST", body });
+      }
+      else if (action === "reject") await api(`/api/candidates/${id}/reject`, { method: "POST" });
+      else await api(`/api/candidates/${id}/snooze`, { method: "POST" });
+    }
+    toast(`已批量处理 ${ids.length} 条候选`);
+    loadInbox(); loadTree();
+  } catch (e) { toast("批量处理失败：" + e.message, 6000); }
+}
+
+/* ---------- tree ---------- */
+let treeNodes = [];
+async function loadTree() {
+  try {
+    const d = await api("/api/tree");
+    treeNodes = d.nodes;
+    const byParent = {};
+    d.nodes.forEach(n => { (byParent[n.parent_id ?? "ROOT"] ||= []).push(n); });
+    function render(pid) {
+      const kids = byParent[pid] || [];
+      return kids.map(n => {
+        const has = (byParent[n.id] || []).length > 0;
+        return `<div class="tree-node">
+          <div class="tree-row">
+            <span class="toggle" onclick="toggleBranch(event,'${n.id}')">${has ? "▾" : "·"}</span>
+            <span onclick="openNode('${n.id}')" style="flex:1">${esc(n.title)}</span>
+            <span class="type">${esc(n.node_type)}</span>
+            <span class="muted">${esc(n.id)}</span>
+          </div>
+          <div class="tree-children" id="branch-${n.id}">${render(n.id)}</div>
+        </div>`;
+      }).join("");
+    }
+    $("#treeRoot").innerHTML = render("ROOT") || '<p class="muted">思维树还是空的，先在待确认箱记录第一条思想吧。</p>';
+  } catch (e) { /* handled */ }
+}
+function toggleBranch(ev, id) {
+  const el = $(`#branch-${id}`);
+  const hidden = el.style.display === "none";
+  el.style.display = hidden ? "" : "none";
+  ev.target.textContent = hidden ? "▾" : "▸";
+}
+async function promptNewRoot() {
+  const title = prompt("一级主题名称："); if (!title) return;
+  await api("/api/nodes", { method: "POST", body: { title, body: "", node_type: "topic" } });
+  loadTree();
+}
+
+/* ---------- node detail ---------- */
+async function openNode(id) {
+  currentNodeId = id;
+  gotoView("node");
+  const d = await api(`/api/nodes/${id}`);
+  const rels = d.relations.map(r => `
+    <tr>
+      <td><span class="badge ${r.state === "confirmed" ? "ok" : (r.state === "stale" ? "" : "warn")}">${r.state}</span></td>
+      <td>${esc(r.from_title)} <b>--${r.relation_type}--&gt;</b> ${esc(r.to_title)}</td>
+      <td class="muted">${esc(r.rationale || "")}</td>
+      <td>
+        ${r.state === "ai_generated" ? `<button class="small" onclick="setRel('${r.id}','confirmed')">确认</button>
+        <button class="small danger" onclick="setRel('${r.id}','rejected')">否决</button>` : ""}
+        ${r.state === "stale" ? `<button class="small" onclick="setRel('${r.id}','confirmed')">重新确认</button>` : ""}
+      </td>
+    </tr>`).join("");
+  const hist = d.history.map(h => `
+    <tr><td>rev ${h.revision_no}</td><td>${esc(h.change_type)}</td><td>${esc(h.created_at)}</td>
+      <td>${h.revision_no !== d.revision_no ? `<button class="small ghost" onclick="restoreRev('${id}',${h.revision_no})">恢复此版本</button>` : '<span class="badge ok">当前</span>'}</td></tr>`).join("");
+  $("#nodeDetail").innerHTML = `
+    <div class="muted">${d.path.map(p => esc(p.title)).join(" / ")}</div>
+    <h2 style="margin:8px 0">${esc(d.node.title)}
+      <span class="type badge">${esc(d.node.node_type)}</span>
+      <span class="badge">rev ${d.revision_no}</span></h2>
+    <textarea id="nodeBody" style="min-height:120px">${esc(d.body)}</textarea>
+    <div class="row" style="margin-top:10px">
+      <button class="small" onclick="saveNode('revise')">保存为修正版本</button>
+      <button class="small ghost" onclick="saveNode('append')">追加为补充版本</button>
+      <button class="small ghost" onclick="moveNodePrompt('${id}')">移动</button>
+      <button class="small ghost" onclick="loadGraphFor('${id}')">查看关系图</button>
+      <button class="small danger" onclick="archiveNode('${id}')">归档</button>
+    </div>
+    <h2 style="margin-top:18px">语义关系</h2>
+    ${rels ? `<table><tr><th>状态</th><th>关系</th><th>理由</th><th></th></tr>${rels}</table>` : '<p class="muted">暂无关系。</p>'}
+    <h2 style="margin-top:18px">历史版本</h2>
+    <table><tr><th>版本</th><th>动作</th><th>时间</th><th></th></tr>${hist}</table>`;
+}
+async function saveNode(changeType) {
+  await api(`/api/nodes/${currentNodeId}`, { method: "POST",
+    body: { change_type: changeType, body: $("#nodeBody").value } });
+  toast(changeType === "revise" ? "已保存修正版本（旧版本保留，相关关系进入 stale）" : "已追加补充版本");
+  openNode(currentNodeId); loadTree();
+}
+async function moveNodePrompt(id) {
+  const target = prompt("新父节点 ID（留空表示移动为一级主题）：");
+  if (target === null) return;
+  try {
+    await api(`/api/nodes/${id}/move`, { method: "POST", body: { new_parent_id: target || null } });
+    toast("已移动"); openNode(id); loadTree();
+  } catch (e) { toast("移动失败：" + e.message, 6000); }
+}
+async function archiveNode(id) {
+  if (!confirm("归档该节点？（软删除，历史保留）")) return;
+  await api(`/api/nodes/${id}/archive`, { method: "POST" });
+  toast("已归档"); gotoView("tree"); loadTree();
+}
+async function restoreRev(id, no) {
+  await api(`/api/nodes/${id}/restore/${no}`, { method: "POST" });
+  toast("已恢复为新版本"); openNode(id);
+}
+async function setRel(relId, state) {
+  await api(`/api/relations/${relId}/state`, { method: "POST", body: { state } });
+  openNode(currentNodeId);
+}
+
+/* ---------- relations graph ---------- */
+function loadGraphFor(id) { $("#graphNodeId").value = id; gotoView("graph"); loadGraph(); }
+async function loadGraph() {
+  const id = $("#graphNodeId").value.trim(); if (!id) return;
+  try {
+    const d = await api(`/api/relations/graph?node_id=${encodeURIComponent(id)}&depth=${$("#graphDepth").value}`);
+    drawGraph(d, id);
+  } catch (e) { toast(e.message, 5000); }
+}
+function drawGraph(d, centerId) {
+  const svg = $("#graphSvg");
+  const W = svg.clientWidth || 900, H = 480, cx = W / 2, cy = H / 2;
+  const pos = {};
+  const others = d.nodes.filter(n => n.id !== centerId);
+  pos[centerId] = { x: cx, y: cy };
+  others.forEach((n, i) => {
+    const angle = (2 * Math.PI * i) / Math.max(others.length, 1);
+    pos[n.id] = { x: cx + Math.cos(angle) * Math.min(cx - 90, 300), y: cy + Math.sin(angle) * (cy - 70) };
+  });
+  let out = "";
+  d.relations.forEach(r => {
+    const a = pos[r.from_node_id], b = pos[r.to_node_id];
+    if (!a || !b) return;
+    out += `<line class="${r.state}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke-width="1.5"/>`;
+    out += `<text class="edge-label" x="${(a.x + b.x) / 2}" y="${(a.y + b.y) / 2 - 4}" text-anchor="middle">${esc(r.relation_type)}</text>`;
+  });
+  d.nodes.forEach(n => {
+    const p = pos[n.id]; if (!p) return;
+    out += `<g style="cursor:pointer" onclick="openNode('${n.id}')">
+      <circle cx="${p.x}" cy="${p.y}" r="${n.id === centerId ? 10 : 7}"/>
+      <text x="${p.x}" y="${p.y - 14}" text-anchor="middle">${esc(n.title.slice(0, 16))}</text></g>`;
+  });
+  svg.innerHTML = out;
+  $("#graphEdges").innerHTML = d.relations.length
+    ? `<table><tr><th>状态</th><th>关系</th><th>置信度</th><th>理由</th></tr>` +
+      d.relations.map(r => `<tr>
+        <td><span class="badge ${r.state === "confirmed" ? "ok" : "warn"}">${r.state}</span></td>
+        <td>${esc(r.from_title)} --${r.relation_type}--&gt; ${esc(r.to_title)}</td>
+        <td>${r.confidence != null ? r.confidence.toFixed(2) : "-"}</td>
+        <td class="muted">${esc(r.rationale || "")}</td></tr>`).join("") + "</table>"
+    : '<p class="muted">该节点暂无语义关系。</p>';
+}
+
+/* ---------- search & QA ---------- */
+async function doSearch() {
+  const q = $("#searchQ").value.trim(); if (!q) return;
+  const d = await api("/api/search", { method: "POST", body: { q } });
+  $("#searchResults").innerHTML = d.results.length ? d.results.map(r => `
+    <div class="card" style="cursor:pointer" onclick="openNode('${r.node_id}')">
+      <b>${esc(r.title)}</b> <span class="badge">${esc(r.match)}</span>
+      <div class="muted">${esc(r.path || "")}</div>
+      ${r.snippet ? `<div class="muted">${esc(r.snippet)}</div>` : ""}
+    </div>`).join("") : '<p class="muted">没有找到匹配节点。</p>';
+}
+async function doQuery() {
+  const q = $("#queryQ").value.trim(); if (!q) return;
+  $("#queryResult").innerHTML = '<p class="muted">思考中…</p>';
+  try {
+    const d = await api("/api/query", { method: "POST", body: { question: q } });
+    $("#queryResult").innerHTML = `
+      <div class="card"><div class="qa-answer">${esc(d.answer)}</div>
+      ${d.citations.map(c => `<span class="citation" onclick="openNode('${c.node_id}')">
+        引用：${esc(c.path)} （${c.node_id} rev ${c.revision_no}）</span>`).join("")}
+      ${d.new_inferences.map(i => `<span class="inference">本次推论（非历史观点）：${esc(i)}</span>`).join("")}
+      </div>`;
+  } catch (e) { $("#queryResult").innerHTML = `<p class="muted">问答失败：${esc(e.message)}</p>`; }
+}
+
+/* ---------- settings ---------- */
+async function loadStatus() {
+  const st = await api("/api/status");
+  $("#statusBox").innerHTML = `
+    <table>
+      <tr><td>运行 Profile</td><td>${esc(st.profile)}</td></tr>
+      <tr><td>正式节点</td><td>${st.nodes ?? "-"}</td></tr>
+      <tr><td>语义关系</td><td>${st.relations ?? "-"}</td></tr>
+      <tr><td>待确认候选</td><td>${st.pending_candidates ?? "-"}</td></tr>
+      <tr><td>sealed inbox 积压</td><td>${st.sealed_inbox_backlog}</td></tr>
+      <tr><td>解锁时间</td><td>${esc(st.unlocked_at || "-")}</td></tr>
+    </table>`;
+}
+async function loadConfig() {
+  const c = await api("/api/config");
+  $("#bindingsBox").innerHTML = `<table><tr><th>ID</th><th>Channel</th><th>账号</th><th>启用</th><th>被动采集</th></tr>` +
+    c.source_bindings.map(b => `<tr><td>${esc(b.id)}</td><td>${esc(b.channel)}</td><td>${esc(b.account_id)}</td>
+      <td>${b.enabled ? "✓" : "✗"}</td><td>${b.passive_capture ? "✓" : "✗"}</td></tr>`).join("") + "</table>" +
+    `<p class="muted" style="margin-top:8px">每日提取：${esc(String(c.daily_capture.schedule))}（${esc(String(c.daily_capture.timezone))}），` +
+    `模型 Agent：${esc(JSON.stringify(c.models.task_agents))}</p>`;
+}
+async function loadJobs() {
+  const d = await api("/api/jobs");
+  $("#jobsBox").innerHTML = d.jobs.length ? `<table><tr><th>类型</th><th>状态</th><th>消息</th><th>候选</th><th>开始</th></tr>` +
+    d.jobs.map(j => `<tr><td>${esc(j.job_type)}</td>
+      <td><span class="badge ${j.status === "ok" ? "ok" : (j.status === "running" ? "warn" : "bad")}">${esc(j.status)}</span></td>
+      <td>${j.messages_in}</td><td>${j.candidates_out}</td><td class="muted">${esc(j.started_at)}</td></tr>`).join("") + "</table>"
+    : '<p class="muted">还没有任务记录。</p>';
+}
+async function runDaily() {
+  try {
+    const d = await api("/api/daily/run", { method: "POST" });
+    toast(d.locked ? "数据库锁定，未处理" :
+      `处理 ${d.processed} 条消息，生成 ${d.candidates} 条候选` + (d.failed ? "（失败，水位线未推进）" : ""));
+    loadInbox(); loadJobs(); loadStatus();
+  } catch (e) { toast("每日提取失败：" + e.message, 6000); }
+}
+async function checkModels() {
+  $("#modelHealth").innerHTML = '<p class="muted">检查中…</p>';
+  const d = await api("/api/models/health");
+  $("#modelHealth").innerHTML = "<table>" + Object.entries(d).map(([task, h]) =>
+    `<tr><td>${esc(task)}</td><td>${esc(h.model)}</td><td>${esc(h.requested_backend_model || "Agent 默认")}</td>
+     <td><span class="badge ${h.ok ? "ok" : "bad"}">${h.ok ? "正常" : esc(h.error)}</span></td></tr>`).join("") + "</table>";
+}
+async function loadDictionary() {
+  try {
+    const d = await api("/api/dictionary");
+    $("#dictionaryBox").innerHTML = d.terms.length
+      ? d.terms.map(t => `<span class="badge" style="margin:3px">${esc(t.term)}
+          <button class="ghost small dict-remove" data-term="${esc(encodeURIComponent(t.term))}">×</button></span>`).join("")
+      : '<span class="muted">词典为空</span>';
+  } catch (e) { /* session handler */ }
+}
+async function addDictionaryTerm() {
+  const term = $("#dictTerm").value.trim(); if (!term) return;
+  await api("/api/dictionary", { method: "POST", body: {
+    term, note: $("#dictNote").value.trim() || null
+  }});
+  $("#dictTerm").value = ""; $("#dictNote").value = ""; loadDictionary();
+}
+async function removeDictionaryTerm(encodedTerm) {
+  await api(`/api/dictionary/${encodedTerm}`, { method: "DELETE" });
+  loadDictionary();
+}
+$("#dictionaryBox").addEventListener("click", (event) => {
+  const button = event.target.closest(".dict-remove");
+  if (button) removeDictionaryTerm(button.dataset.term);
+});
+async function doBackup() {
+  try {
+    const d = await api("/api/backup", { method: "POST" });
+    toast(`加密备份完成：${d.counts.nodes} 节点 / ${d.counts.revisions} 版本 → ${d.backup_dir}`, 6000);
+  } catch (e) { toast("备份失败：" + e.message, 6000); }
+}
+async function doExport() {
+  try {
+    const d = await api("/api/export", { method: "POST", body: {
+      format: $("#exportFormat").value,
+      root_id: $("#exportRoot").value.trim() || null,
+      include_history: $("#exportHistory").checked,
+      include_ai_relations: $("#exportAiRel").checked,
+      encryption_passphrase: $("#exportPassword").value || null,
+    }});
+    const fname = d.path.split(/[\\/]/).pop();
+    $("#exportResult").innerHTML = `<div class="card">已导出 ${d.nodes} 个节点、${d.relations} 条关系
+      （SHA-256 ${esc(d.file_hash.slice(0, 16))}…）
+      <a href="/api/export/${encodeURIComponent(fname)}" style="color:var(--accent)">下载</a>
+      <span class="muted">${d.plaintext ? "明文文件将在 TTL 到期后自动删除" : "口令加密包（服务端未写明文临时文件）"}</span></div>`;
+    $("#exportPassword").value = "";
+  } catch (e) { toast("导出失败：" + e.message, 6000); }
+}
+
+boot();
+</script>
+</body>
+</html>
