@@ -45,11 +45,11 @@ source_bindings:
 
   - id: yu_weixin
     profiles: [tencent_cloud]
-    enabled: false
+    enabled: true
     channel: openclaw-weixin
-    account_id: "<deployment-probe-result>"
-    sender_key: "<yu-from-user-id>"
-    conversation_id: "<private-conversation-id-if-present>"
+    account_id: "66278cd41480-im-bot"
+    sender_key: "o9cq8058R7wmTrx-3gQk-4GK_FX4@im.wechat"
+    conversation_id: "o9cq8058R7wmTrx-3gQk-4GK_FX4@im.wechat"
     binding_key: auto_hmac
     allow_group: false
     passive_capture: true

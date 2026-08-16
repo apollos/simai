@@ -132,7 +132,6 @@ function registerSimai(api: OpenClawPluginApi): void {
         `owner=${String(ctx.senderIsOwner)}`,
     );
     if (!ctx.sessionKey) return deny("missing_session_key");
-    if (ctx.senderIsOwner === false) return deny("sender_not_owner");
     const identity = verifiedSessions.get(ctx.sessionKey);
     if (!identity) return deny("session_not_correlated");
     if (Date.now() - identity.receivedAt > correlationWindowMs) return deny("correlation_expired");
@@ -141,6 +140,10 @@ function registerSimai(api: OpenClawPluginApi): void {
     // Owner-only channels (allowMissingIdentity) legitimately omit ambient
     // identity in the tool context; present fields must still match exactly.
     const lax = binding.allowMissingIdentity === true;
+    // The host's owner flag is channel-dependent (weixin reports false for the
+    // bound sender). Strict bindings are authorized by the exact correlated
+    // identity tuple below; only identity-less owner channels require it.
+    if (lax && ctx.senderIsOwner === false) return deny("sender_not_owner");
 
     const channel = exactAmbient(ctx.messageChannel, ctx.deliveryContext?.channel);
     const accountId = exactAmbient(ctx.agentAccountId, ctx.deliveryContext?.accountId);

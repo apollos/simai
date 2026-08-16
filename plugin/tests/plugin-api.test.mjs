@@ -309,6 +309,77 @@ test("2026.7.1 hooks correlate exact identity and tools use factory/execute", as
   }
 });
 
+test("strict binding authorizes despite host owner=false when identity fully matches", async () => {
+  const root = mkdtempSync(join(process.cwd(), ".simai-plugin-owner-"));
+  try {
+    await sodium.ready;
+    const keypair = sodium.crypto_box_keypair();
+    writeFileSync(join(root, "vault.header.json"), JSON.stringify({
+      format_version: 1,
+      sealed_inbox_public_key: Buffer.from(keypair.publicKey).toString("base64"),
+    }), { mode: 0o600 });
+    writeFileSync(join(root, "plugin.token"), "x".repeat(32), { mode: 0o600 });
+    const runtime = mockApi(pluginConfig(root, join(root, "inbox.sock")));
+    plugin.register(runtime.api);
+
+    const receive = runtime.typedHooks.get("message_received");
+    const preprocess = runtime.internalHooks.get("message:preprocessed").handler;
+    await receive(
+      { from: binding.senderKey, content: "想法", messageId: "o1", sessionKey: "so1" },
+      {
+        channelId: binding.channel,
+        accountId: binding.accountId,
+        conversationId: binding.conversationId,
+        senderId: binding.senderKey,
+        messageId: "o1",
+        sessionKey: "so1",
+      },
+    );
+    await preprocess({
+      type: "message",
+      action: "preprocessed",
+      sessionKey: "so1",
+      messages: [],
+      context: {
+        bodyForAgent: "想法",
+        from: binding.senderKey,
+        senderId: binding.senderKey,
+        channelId: binding.channel,
+        conversationId: binding.conversationId,
+        messageId: "o1",
+        isGroup: false,
+      },
+    });
+
+    // Real weixin tool context: owner=false, requester absent, but channel/
+    // account/delivery target all pin the bound private conversation.
+    const captureRegistration = runtime.tools.find(({ options }) =>
+      options.names.includes("simai_capture"));
+    const tool = captureRegistration.factory({
+      sessionKey: "so1",
+      messageChannel: binding.channel,
+      agentAccountId: binding.accountId,
+      senderIsOwner: false,
+      deliveryContext: { to: binding.conversationId },
+    });
+    const result = await tool.execute("call-owner-1", { text: "微信想法" });
+    assert.match(JSON.stringify(result.details), /待确认箱/);
+
+    // A mismatching delivery target must still be rejected.
+    const wrongTool = captureRegistration.factory({
+      sessionKey: "so1",
+      messageChannel: binding.channel,
+      agentAccountId: binding.accountId,
+      senderIsOwner: false,
+      deliveryContext: { to: "someone-else" },
+    });
+    const denied = await wrongTool.execute("call-owner-2", { text: "微信想法" });
+    assert.match(JSON.stringify(denied.details), /not whitelisted/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("webchat owner binding captures identity-less payloads and authorizes tools", async () => {
   const root = mkdtempSync(join(process.cwd(), ".simai-plugin-webchat-"));
   try {
@@ -399,6 +470,15 @@ test("webchat owner binding captures identity-less payloads and authorizes tools
     const result = await tool.execute("call-web-1", { text: "网页想法" });
     // Core is unreachable in this test, so the encrypted fallback answers.
     assert.match(JSON.stringify(result.details), /待确认箱/);
+
+    // Identity-less owner channels still require the host owner flag.
+    const nonOwnerTool = captureRegistration.factory({
+      sessionKey: "ws1",
+      messageChannel: "webchat",
+      senderIsOwner: false,
+    });
+    const deniedNonOwner = await nonOwnerTool.execute("call-web-2", { text: "网页想法" });
+    assert.match(JSON.stringify(deniedNonOwner.details), /not whitelisted/);
 
     // A strict binding must still reject identity-less payloads.
     const strictRuntime = mockApi({

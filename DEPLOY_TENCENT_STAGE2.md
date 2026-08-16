@@ -41,15 +41,16 @@ simai: {
     vaultHeaderPath: "/home/yu/.simai/vault.header.json",
     inboxDir: "/home/yu/.simai/inbox",
     probeMode: true,
-    bindings: [
+    "bindings": [
       {
-        id: "yu_weixin",
-        channel: "openclaw-weixin",
-        accountId: "placeholder",
-        senderKey: "placeholder",
-        allowGroup: false,
-        passiveCapture: true,
-        enabled: false
+        "id": "yu_weixin",
+        "channel": "openclaw-weixin",
+        "accountId": "66278cd41480-im-bot",
+        "senderKey": "o9cq8058R7wmTrx-3gQk-4GK_FX4@im.wechat",
+        "conversationId": "o9cq8058R7wmTrx-3gQk-4GK_FX4@im.wechat",
+        "allowGroup": false,
+        "passiveCapture": true,
+        "enabled": true
       }
     ]
   }
