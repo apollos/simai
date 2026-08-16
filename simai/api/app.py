@@ -547,7 +547,7 @@ def create_app(config: Config, state: AppState | None = None) -> FastAPI:
     def model_health():
         return {
             task: app.state.llm.health_check(task)
-            for task in ("capture", "daily_extract", "graph_routing", "query")
+            for task in ("capture", "daily_extract", "graph_routing", "query", "query_relevance")
         }
 
     # -- personal dictionary (section 8.3) ---------------------------------------

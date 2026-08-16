@@ -279,6 +279,29 @@ def tree(root: str = typer.Option(None, help="局部根节点 ID"), config: str 
 
 
 @app.command()
+def reindex(config: str = CONFIG_OPT):
+    """为所有活跃节点重新计算 embedding（embedding 首次打通后需要跑一次）。"""
+    state = _state(config)
+    _unlock_interactive(state)
+    from .core import search
+    from .llm.client import ModelError, build_client
+
+    try:
+        with state.transaction() as tx:
+            summary = search.reindex_all(tx, build_client(state.config))
+    except ModelError as exc:
+        typer.secho(f"embedding 不可用：{exc}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    typer.echo(json.dumps(summary, ensure_ascii=False))
+    if summary["skipped"]:
+        typer.secho(
+            f"{summary['skipped']} 个节点未能写入向量（模型失败或无当前版本）。",
+            fg=typer.colors.YELLOW,
+        )
+    state.lock()
+
+
+@app.command()
 def query(config: str = CONFIG_OPT):
     """从 stdin（或安全交互提示）读取问题，并引用节点与版本回答。"""
     state = _state(config)

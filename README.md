@@ -56,12 +56,13 @@ models:
     daily_extract: simai
     graph_routing: simai
     query: simai
+    query_relevance: simai
   # 可选择与 OpenClaw default 不同的后台模型；值通过
   # x-openclaw-model 交给 OpenClaw 路由，Provider 凭据仍由 OpenClaw 管理。
   task_models:
     capture: qwen/qwen3.5-plus
     daily_extract: qwen/qwen3.5-plus
-  embedding_model: openclaw/simai-embedding
+  embedding_model: embeddinggemma-300m
   # Gateway 开启鉴权时填写其 token 文件；必须为 0600 且不可是符号链接。
   gateway_token_file: ~/.openclaw/gateway.token
 ~~~

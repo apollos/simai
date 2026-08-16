@@ -139,11 +139,11 @@ def run(workdir: Path) -> None:
         ok("model capture fails loudly (502)", r.status_code == 502)
         r = client.post("/api/query", json={"question": "没有任何命中的问题词"})
         ok(
-            "query with no hits answers honestly (no model call)",
-            r.status_code == 200 and r.json()["citations"] == [],
+            "query on a non-empty tree fails loudly when the judge model is down (502)",
+            r.status_code == 502,
         )
         r = client.post("/api/query", json={"question": "单用户"})
-        ok("query with hits fails loudly when model down (502)", r.status_code == 502)
+        ok("query with lexical hits fails loudly when model down (502)", r.status_code == 502)
 
         print("tree & relations")
         r = client.post("/api/nodes", json={"title": "组织管理", "body": "顶层主题", "node_type": "topic"})

@@ -117,6 +117,12 @@ class RelationProposals(BaseModel):
     relations: list[RelationProposal] = Field(default_factory=list, max_length=5)
 
 
+class QueryRelevance(BaseModel):
+    """Precision filter after recall: only nodes that actually answer the question."""
+
+    node_ids: list[str] = Field(default_factory=list, max_length=8)
+
+
 class QueryCitation(BaseModel):
     node_id: str
     revision_no: int

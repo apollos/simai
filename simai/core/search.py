@@ -43,7 +43,7 @@ def upsert_embedding(conn, client: OpenClawClient, node_id: str) -> bool:
     if rev is None:
         return False
     try:
-        [vector] = client.embed([f"{rev['title']}\n{rev['body']}"])
+        [vector] = client.embed([f"{rev['title']}\n{rev['body']}"], kind="document")
     except ModelError as exc:
         log.warning("embedding skipped node=%s reason=%s", node_id, exc)
         return False
@@ -76,10 +76,16 @@ def keyword_search(conn, query: str, limit: int = 20) -> list[dict]:
     return [dict(r) | {"match": "keyword"} for r in rows]
 
 
-def semantic_search(conn, client: OpenClawClient, query: str, limit: int = 10) -> list[dict]:
+def semantic_search(
+    conn, client: OpenClawClient, query: str, limit: int = 10, min_score: float = 0.0
+) -> list[dict]:
     """Unlocked-memory cosine ranking; explicit ModelError if embeddings
-    are unavailable (callers may fall back to keyword search)."""
-    [qvec] = client.embed([query])
+    are unavailable (callers may fall back to keyword search).
+
+    Scores at or below min_score are dropped. The default 0.0 only
+    removes noise (zero/negative cosine), not a relevance policy.
+    """
+    [qvec] = client.embed([query], kind="query")
     rows = conn.execute(
         """SELECT e.node_id, e.vector_blob, n.title, n.node_type, n.updated_at
            FROM embeddings e JOIN nodes n ON n.id = e.node_id
@@ -88,13 +94,20 @@ def semantic_search(conn, client: OpenClawClient, query: str, limit: int = 10) -
         (client.embedding_model,),
     ).fetchall()
     scored = [dict(r, score=_cosine(qvec, _unpack(r["vector_blob"])), match="semantic") for r in rows]
+    scored = [item for item in scored if item["score"] > min_score]
     scored.sort(key=lambda d: d["score"], reverse=True)
     for item in scored:
         item.pop("vector_blob", None)
     return scored[:limit]
 
 
-def combined_search(conn, client: OpenClawClient | None, query: str, limit: int = 10) -> list[dict]:
+def combined_search(
+    conn,
+    client: OpenClawClient | None,
+    query: str,
+    limit: int = 10,
+    semantic_min_score: float = 0.0,
+) -> list[dict]:
     """Keyword + semantic union used by the web UI and simai_search tool."""
     results: dict[str, dict] = {}
     try:
@@ -104,7 +117,7 @@ def combined_search(conn, client: OpenClawClient | None, query: str, limit: int 
         log.info("keyword search failed for query, continuing with semantic only")
     if client is not None:
         try:
-            for item in semantic_search(conn, client, query, limit):
+            for item in semantic_search(conn, client, query, limit, min_score=semantic_min_score):
                 results.setdefault(item["node_id"], item)
         except ModelError as exc:
             log.warning("semantic search unavailable: %s", exc)
@@ -112,6 +125,53 @@ def combined_search(conn, client: OpenClawClient | None, query: str, limit: int 
     for item in out:
         item["path"] = " / ".join(p["title"] for p in tree.node_path(conn, item["node_id"]))
     return out[:limit]
+
+
+SMALL_TREE_MAX = 20
+RECALL_LIMIT = 20
+
+
+def count_active_nodes(conn) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM nodes WHERE state = 'active'").fetchone()[0])
+
+
+def list_active_hits(conn) -> list[dict]:
+    rows = conn.execute(
+        """SELECT id AS node_id, title, node_type, updated_at
+           FROM nodes WHERE state = 'active' ORDER BY updated_at DESC"""
+    ).fetchall()
+    out = [dict(r) | {"match": "all"} for r in rows]
+    for item in out:
+        item["path"] = " / ".join(p["title"] for p in tree.node_path(conn, item["node_id"]))
+    return out
+
+
+def recall_for_qa(
+    conn,
+    client: OpenClawClient | None,
+    query: str,
+    small_tree_max: int = SMALL_TREE_MAX,
+    recall_limit: int = RECALL_LIMIT,
+) -> list[dict]:
+    """Candidate generation for Q&A. Small trees skip ranking and return
+    every active node; larger trees use keyword+semantic recall."""
+    if count_active_nodes(conn) <= small_tree_max:
+        return list_active_hits(conn)
+    return combined_search(conn, client, query, limit=recall_limit, semantic_min_score=0.0)
+
+
+def reindex_all(conn, client: OpenClawClient) -> dict:
+    """Recompute embeddings for every active node. Used after the
+    embedding backend becomes available for the first time."""
+    rows = conn.execute("SELECT id FROM nodes WHERE state = 'active'").fetchall()
+    written = 0
+    skipped = 0
+    for row in rows:
+        if upsert_embedding(conn, client, row["id"]):
+            written += 1
+        else:
+            skipped += 1
+    return {"nodes": len(rows), "written": written, "skipped": skipped}
 
 
 def similar_nodes(conn, client: OpenClawClient, text: str, limit: int = 5) -> list[dict]:

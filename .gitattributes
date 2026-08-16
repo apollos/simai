@@ -1,0 +1,16 @@
+# Normalize all text files to LF in the repository and the working tree.
+# Simai runs on Linux (WSL / Tencent Cloud); CRLF breaks shebangs, here-docs
+# and produces noisy diffs when files are touched from the Windows side.
+* text=auto eol=lf
+
+# Vault and backup artifacts must never be line-ending converted.
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.zip binary
+*.tar.gz binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary

@@ -32,6 +32,7 @@ from simai.llm.schemas import (
     PlacementResult,
     QueryAnswer,
     QueryCitation,
+    QueryRelevance,
 )
 
 PASS = "correct horse battery staple"
@@ -52,10 +53,17 @@ class FakeLLM:
 
     embedding_model = "stub-embedding"
 
+    def __init__(self) -> None:
+        self.answer_calls = 0
+        self.judge_calls = 0
+
     def model_for(self, task: str) -> str:
         return f"openclaw/stub-{task}"
 
     def structured(self, task, system, user, schema):
+        if schema is QueryRelevance:
+            self.judge_calls += 1
+            return QueryRelevance(node_ids=_relevant_stub_ids(user))
         if schema is CaptureBatchResult:
             parts = [part.strip() for part in user.split("；") if part.strip()]
             return CaptureBatchResult(
@@ -77,6 +85,7 @@ class FakeLLM:
                 proposed_parent_ids=ids[:1],
             )
         if schema is QueryAnswer:
+            self.answer_calls += 1
             ids = re.findall(r"N-\d{8}-[0-9a-f]+", user)
             return QueryAnswer(
                 answer="测试回答",
@@ -104,8 +113,25 @@ class FakeLLM:
             return DailyExtractResult(items=items)
         raise AssertionError(f"unexpected schema {schema}")
 
-    def embed(self, texts):
+    def embed(self, texts, *, kind="document"):
+        assert kind in ("document", "query")
         return [[1.0, 0.0] for _ in texts]
+
+
+def _relevant_stub_ids(user: str) -> list[str]:
+    """Keep candidate nodes whose text overlaps the question's CJK bigrams."""
+    qline = user.split("QUESTION:", 1)[1].split("\n", 1)[0] if "QUESTION:" in user else user
+    chars = re.findall(r"[\u4e00-\u9fff]", qline)
+    needles = {"".join(chars[i : i + 2]) for i in range(max(0, len(chars) - 1))}
+    if len(chars) == 1:
+        needles.add(chars[0])
+    needles.update(re.findall(r"[A-Za-z0-9_]{2,}", qline))
+    kept: list[str] = []
+    for block in re.split(r"\n(?=NODE )", user):
+        match = re.match(r"NODE (N-\d{8}-[0-9a-f]+)", block.strip())
+        if match and needles and any(needle in block for needle in needles):
+            kept.append(match.group(1))
+    return kept
 
 
 def main() -> None:
@@ -468,16 +494,73 @@ def run(workdir: Path) -> None:
     )
 
     print("search")
-    from simai.core.search import keyword_search
+    from simai.core.search import keyword_search, reindex_all, semantic_search
+    from simai.core.textseg import build_match_query
+    from simai.llm.client import _embedding_route, _prefixed_inputs
+
+    ok(
+        "embedding route uses the simai agent and a slash-free override",
+        _embedding_route("embeddinggemma-300m") == ("openclaw/simai", "embeddinggemma-300m")
+        and _embedding_route("openclaw/simai") == ("openclaw/simai", None)
+        and _embedding_route("openai/Qwen/Qwen3-Embedding-8B")
+        == ("openclaw/simai", "openai/Qwen/Qwen3-Embedding-8B"),
+    )
+    ok(
+        "embeddinggemma gets asymmetric prompt prefixes, other models do not",
+        _prefixed_inputs(["文本"], "embeddinggemma-300m", "query")
+        == ["task: search result | query: 文本"]
+        and _prefixed_inputs(["文本"], "embeddinggemma-300m", "document")
+        == ["title: none | text: 文本"]
+        and _prefixed_inputs(["文本"], "openai/Qwen/Qwen3-Embedding-8B", "query") == ["文本"],
+    )
 
     hits = keyword_search(state.conn, "自治")
     ok("fts keyword search", any(h["node_id"] == child["node_id"] for h in hits))
-    answer = qa.answer_question(state.conn, FakeLLM(), "自治")
+    sentence_hits = keyword_search(state.conn, "我对小团队自治有什么看法？")
+    ok(
+        "fts keyword search matches a natural-language question",
+        any(h["node_id"] == child["node_id"] for h in sentence_hits),
+    )
+    ok(
+        "full-width punctuation never reaches the MATCH expression",
+        "？" not in build_match_query("自治？") and build_match_query("？，。") == "",
+    )
+    reindex = reindex_all(state.conn, FakeLLM())
+    ok("reindex writes an embedding for every active node", reindex["written"] == reindex["nodes"] > 0)
+    semantic_hits = semantic_search(state.conn, FakeLLM(), "完全不同的措辞", limit=3)
+    ok("semantic search ranks stored vectors even without keyword overlap", bool(semantic_hits))
+    stub = FakeLLM()
+    recalled = search.recall_for_qa(state.conn, stub, "自治")
+    ok(
+        "small trees recall every active node before judging",
+        len(recalled) == state.conn.execute("SELECT COUNT(*) FROM nodes WHERE state='active'").fetchone()[0],
+    )
+    answer = qa.answer_question(state.conn, stub, "自治")
     citation = answer["citations"][0]
     expected_rev = tree.get_current_revision(state.conn, citation["node_id"])
     ok(
         "query citation path/revision canonicalized from database",
         citation["revision_no"] == expected_rev["revision_no"] and citation["path"] != "错误 / 路径",
+    )
+    ok("query judge runs before the answer call", stub.judge_calls == 1 and stub.answer_calls == 1)
+    ok(
+        "query judge drops nodes that do not answer the question",
+        all(
+            "自治" in (rev["title"] + rev["body"])
+            for c in answer["citations"]
+            for rev in [tree.get_current_revision(state.conn, c["node_id"])]
+            if rev is not None
+        )
+        and answer["citations"],
+    )
+    empty_stub = FakeLLM()
+    empty = qa.answer_question(state.conn, empty_stub, "番茄炒蛋怎么做")
+    ok(
+        "empty judge does not fall back to the recall set",
+        empty["answer"].startswith("思维树中没有找到")
+        and empty["citations"] == []
+        and empty_stub.judge_calls == 1
+        and empty_stub.answer_calls == 0,
     )
 
     print("sealed inbox + daily")

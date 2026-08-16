@@ -62,6 +62,8 @@ class OpenClawClient:
 
     def model_for(self, task: str) -> str:
         agent = self.task_agents.get(task)
+        if not agent and task == "query_relevance":
+            agent = self.task_agents.get("query")
         if not agent:
             raise ModelError(f"No agent configured for task '{task}' (models.task_agents)")
         return f"openclaw/{agent}"
@@ -73,7 +75,10 @@ class OpenClawClient:
             resp = self._chat(
                 model,
                 [{"role": "user", "content": "Reply with the single word: ok"}],
-                max_tokens=8,
+                # Reasoning models spend the budget on hidden thinking before
+                # emitting anything visible; too small a cap truncates them into
+                # a reasoning-only turn that the Gateway reports as a failure.
+                max_tokens=512,
                 backend_model=self.task_models.get(task),
             )
             return {
@@ -153,12 +158,15 @@ class OpenClawClient:
         )
 
     # -- embeddings ----------------------------------------------------------
-    def embed(self, texts: list[str]) -> list[list[float]]:
+    def embed(self, texts: list[str], *, kind: str = "document") -> list[list[float]]:
+        """kind is "document" (index time) or "query" (search time); some
+        models (EmbeddingGemma) require asymmetric prompt prefixes."""
         agent_model, backend_model = _embedding_route(self.embedding_model)
+        inputs = _prefixed_inputs(texts, self.embedding_model, kind)
         try:
             r = self._http.post(
                 f"{self.gateway_url}/v1/embeddings",
-                json={"model": agent_model, "input": texts},
+                json={"model": agent_model, "input": inputs},
                 headers={"x-openclaw-model": backend_model} if backend_model else None,
             )
         except httpx.HTTPError as exc:
@@ -198,18 +206,42 @@ def build_client(config) -> OpenClawClient:
     return OpenClawClient(
         gateway_url=config.openclaw_gateway,
         task_agents=models.get("task_agents", {}),
-        embedding_model=models.get("embedding_model", "openclaw/simai-embedding"),
+        embedding_model=models.get("embedding_model", "embeddinggemma-300m"),
         task_models=models.get("task_models", {}),
         gateway_token=token,
     )
 
 
 def _embedding_route(value: str) -> tuple[str, str | None]:
-    """`openclaw/<agent>` selects an agent; anything else overrides that
-    agent's backend embedding model through the supported header."""
+    """Body `model` selects the OpenClaw agent. A non-agent value is sent
+    as `x-openclaw-model` so the agent's memorySearch provider is used.
+
+    OpenClaw rejects a `provider/model` header whose provider does not
+    match `agents.*.memorySearch.provider`. SiliconFlow's Qwen model id
+    contains a slash, so the configured value is
+    `openai/Qwen/Qwen3-Embedding-8B`: the first segment satisfies the
+    provider check, the remainder is the real model name.
+    """
     if value.startswith("openclaw/"):
         return value, None
-    return "openclaw/simai-embedding", value
+    return "openclaw/simai", value
+
+
+# EmbeddingGemma is trained with asymmetric prompts; without them retrieval
+# ranking degrades badly (measured: with bare CJK text an unrelated node can
+# outrank the semantically matching one).
+_GEMMA_PREFIXES = {
+    "query": "task: search result | query: ",
+    "document": "title: none | text: ",
+}
+
+
+def _prefixed_inputs(texts: list[str], embedding_model: str, kind: str) -> list[str]:
+    if kind not in _GEMMA_PREFIXES:
+        raise ValueError(f"unknown embedding kind: {kind}")
+    if "embeddinggemma" not in embedding_model.lower():
+        return texts
+    return [_GEMMA_PREFIXES[kind] + t for t in texts]
 
 
 def _read_gateway_token(raw_path: str | None) -> str | None:

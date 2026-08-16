@@ -23,6 +23,16 @@ button:hover { filter: brightness(1.12); }
 button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
 button.danger { background: var(--bad); }
 button.small { padding: 4px 9px; font-size: 12px; }
+button:disabled { opacity: .55; cursor: not-allowed; filter: none; }
+button.busy { position: relative; color: transparent !important; pointer-events: none; }
+button.busy::after {
+  content: ""; position: absolute; width: 13px; height: 13px;
+  top: 50%; left: 50%; margin: -7px 0 0 -7px; border-radius: 50%;
+  border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+  animation: spin .7s linear infinite;
+}
+button.ghost.busy::after { border-color: rgba(139,147,167,.35); border-top-color: var(--muted); }
+@keyframes spin { to { transform: rotate(360deg); } }
 input, textarea, select {
   background: var(--panel2); border: 1px solid var(--border); color: var(--text);
   border-radius: 7px; padding: 8px 10px; font-size: 13px; width: 100%;
@@ -756,6 +766,35 @@ async function doExport() {
     $("#exportPassword").value = "";
   } catch (e) { toast("导出失败：" + e.message, 6000); }
 }
+
+/* ---------- busy-state protection ----------
+   点击触发的异步操作：按钮立即禁用并显示旋转圈，结束后恢复；
+   进行中重复触发（连点按钮或回车）会被忽略。 */
+let _lastBtn = null, _lastBtnTime = 0;
+document.addEventListener("click", (ev) => {
+  const b = ev.target.closest("button");
+  if (b) { _lastBtn = b; _lastBtnTime = performance.now(); }
+}, true);
+function guard(fn) {
+  let running = false;
+  return async function (...args) {
+    if (running) return;
+    // 只有当本次调用确实由刚刚的按钮点击触发时才接管该按钮
+    const btn = (_lastBtn && performance.now() - _lastBtnTime < 60) ? _lastBtn : null;
+    running = true;
+    if (btn) { btn.disabled = true; btn.classList.add("busy"); }
+    try { return await fn.apply(this, args); }
+    finally {
+      running = false;
+      if (btn) { btn.disabled = false; btn.classList.remove("busy"); }
+    }
+  };
+}
+["doInit", "doUnlock", "doLock", "doCapture", "confirmCand", "rejectCand", "snoozeCand",
+ "batchCandidates", "promptNewRoot", "loadTree", "saveNode", "moveNodePrompt", "archiveNode",
+ "restoreRev", "setRel", "loadGraph", "doSearch", "doQuery", "runDaily", "checkModels",
+ "doBackup", "doExport", "addDictionaryTerm", "removeDictionaryTerm"
+].forEach(n => { window[n] = guard(window[n]); });
 
 boot();
 </script>

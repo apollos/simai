@@ -81,7 +81,12 @@ models:
     daily_extract: simai
     graph_routing: simai
     query: simai
-  embedding_model: openclaw/simai-embedding
+    query_relevance: simai
+  # Sent as x-openclaw-model; body model remains openclaw/simai. The agent's
+  # memorySearch must use provider "local" for embeddinggemma-300m. For a
+  # remote provider (e.g. SiliconFlow), prefix with the provider so OpenClaw
+  # accepts the slash, e.g. openai/Qwen/Qwen3-Embedding-8B.
+  embedding_model: embeddinggemma-300m
   # Optional Gateway bearer token (this is not a provider/model API key).
   # The file must be a non-symlink with mode 0600.
   gateway_token_file: null
