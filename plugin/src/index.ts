@@ -33,7 +33,15 @@ export default plugin;
 
 function registerSimai(api: OpenClawPluginApi): void {
   const config = parsePluginConfig(api.pluginConfig);
-  const enabledBindings = config.bindings.filter((binding) => binding.enabled);
+  const probeMode = config.probeMode === true;
+  const enabledBindings = probeMode
+    ? []
+    : config.bindings.filter((binding) => binding.enabled);
+  // Metadata-only deployment probe. Values identify the source (needed to fill
+  // in bindings); message bodies are reduced to a length and a placeholder flag.
+  const probeLog = (hook: string, fields: Record<string, unknown>): void => {
+    api.logger.info(`simai[probe] ${hook} ${JSON.stringify(fields)}`);
+  };
   const correlationWindowMs = config.correlationWindowMs ?? DEFAULT_CORRELATION_WINDOW_MS;
   const correlations = new CorrelationStore(correlationWindowMs);
   const verifiedSessions = new Map<string, VerifiedIdentity>();
@@ -141,6 +149,19 @@ function registerSimai(api: OpenClawPluginApi): void {
     // Phase one: typed lifecycle hook carries the authoritative OpenClaw
     // channel/account/sender tuple. The group flag is verified in phase two.
     api.on("message_received", async (event, ctx) => {
+      if (probeMode) {
+        probeLog("message_received", {
+          channelId: ctx.channelId ?? null,
+          accountId: ctx.accountId ?? null,
+          senderId: ctx.senderId ?? event.senderId ?? null,
+          from: event.from ?? null,
+          conversationId: ctx.conversationId ?? null,
+          messageId: event.messageId ?? ctx.messageId ?? null,
+          hasSessionKey: Boolean(event.sessionKey ?? ctx.sessionKey),
+          contentLength: event.content?.length ?? 0,
+        });
+        return;
+      }
       if (conflicts(event.messageId, ctx.messageId)) return;
       if (conflicts(event.sessionKey, ctx.sessionKey)) return;
       const messageId = event.messageId ?? ctx.messageId;
@@ -177,6 +198,21 @@ function registerSimai(api: OpenClawPluginApi): void {
       "message:preprocessed",
       async (event) => {
         if (event.type !== "message" || event.action !== "preprocessed") return;
+        if (probeMode) {
+          const probeBody = event.context.bodyForAgent ?? "";
+          probeLog("message_preprocessed", {
+            channelId: event.context.channelId ?? null,
+            senderId: event.context.senderId ?? null,
+            from: event.context.from ?? null,
+            conversationId: event.context.conversationId ?? null,
+            isGroup: event.context.isGroup ?? null,
+            messageId: event.context.messageId ?? null,
+            hasSessionKey: Boolean(event.sessionKey),
+            bodyLength: probeBody.length,
+            bodyLooksLikeMediaPlaceholder: /^\s*\[(audio|voice|video|image)/i.test(probeBody),
+          });
+          return;
+        }
         const body = event.context.bodyForAgent;
         const senderKey = normalizeSenderKey({
           senderId: event.context.senderId,
@@ -207,7 +243,8 @@ function registerSimai(api: OpenClawPluginApi): void {
   }
 
   api.logger.info(
-    `simai plugin registered mode=${api.registrationMode} bindings=${enabledBindings.length}`,
+    `simai plugin registered mode=${api.registrationMode} bindings=${enabledBindings.length}` +
+      (probeMode ? " probeMode=on (capture disabled, metadata-only logging)" : ""),
   );
 }
 
@@ -408,6 +445,9 @@ function parsePluginConfig(raw: Record<string, unknown> | undefined): SimaiPlugi
   ) {
     throw new Error("simai: correlationWindowMs must be 1000..1800000");
   }
+  if (raw.probeMode !== undefined && typeof raw.probeMode !== "boolean") {
+    throw new Error("simai: probeMode must be boolean");
+  }
   return {
     coreUrl,
     coreTokenFile: requiredString(raw, "coreTokenFile"),
@@ -418,6 +458,7 @@ function parsePluginConfig(raw: Record<string, unknown> | undefined): SimaiPlugi
     ...(correlationWindowMs === undefined
       ? {}
       : { correlationWindowMs: correlationWindowMs as number }),
+    ...(raw.probeMode === undefined ? {} : { probeMode: raw.probeMode as boolean }),
   };
 }
 

@@ -53,6 +53,12 @@ openclaw plugins install /opt/simai/plugin
 }
 ~~~
 
+部署新环境时可先在 config 中加 `probeMode: true`（binding 用占位值并保持
+`enabled: false`）：此模式完全停用捕获，仅将每条消息的身份元数据
+（channel/account/sender/conversation/messageId、sessionKey 有无、正文长度与
+是否媒体占位符）以 `simai[probe]` 前缀写入日志，绝不记录正文。抄下真实字段值
+填入 binding 后关闭 probeMode。
+
 同一个 binding 的 `id/channel/accountId/senderKey/conversationId/allowGroup` 必须与
 思脉 YAML 中的 `source_bindings` 完全一致。插件与 Python ingress 都会核验身份；
 未知来源、歧义配置、群聊或关联字段冲突一律拒绝。`sessionKey` 只用于同一轮工具

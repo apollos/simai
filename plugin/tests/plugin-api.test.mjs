@@ -305,6 +305,71 @@ test("2026.7.1 hooks correlate exact identity and tools use factory/execute", as
   }
 });
 
+test("probeMode logs identity metadata only and never captures", async () => {
+  const root = mkdtempSync(join(process.cwd(), ".simai-plugin-probe-"));
+  try {
+    const config = { ...pluginConfig(root, join(root, "inbox.sock")), probeMode: true };
+    const logged = [];
+    const runtime = mockApi(config);
+    runtime.api.logger = {
+      info(message) { logged.push(message); },
+      warn() {},
+      error() {},
+    };
+    plugin.register(runtime.api);
+
+    const receive = runtime.typedHooks.get("message_received");
+    const preprocess = runtime.internalHooks.get("message:preprocessed").handler;
+    const secret = "这句正文绝不能出现在任何日志里";
+    await receive(
+      { from: binding.senderKey, content: secret, messageId: "p1", sessionKey: "ps1" },
+      {
+        channelId: binding.channel,
+        accountId: binding.accountId,
+        conversationId: binding.conversationId,
+        senderId: binding.senderKey,
+        messageId: "p1",
+        sessionKey: "ps1",
+      },
+    );
+    await preprocess({
+      type: "message",
+      action: "preprocessed",
+      sessionKey: "ps1",
+      messages: [],
+      context: {
+        bodyForAgent: "[Audio] placeholder body",
+        from: binding.senderKey,
+        senderId: binding.senderKey,
+        channelId: binding.channel,
+        conversationId: binding.conversationId,
+        messageId: "p1",
+        isGroup: false,
+      },
+    });
+
+    const probeLines = logged.filter((line) => line.includes("simai[probe]"));
+    assert.equal(probeLines.length, 2);
+    const receivedLine = JSON.parse(probeLines[0].replace(/^.*message_received /, ""));
+    assert.equal(receivedLine.channelId, binding.channel);
+    assert.equal(receivedLine.accountId, binding.accountId);
+    assert.equal(receivedLine.senderId, binding.senderKey);
+    assert.equal(receivedLine.messageId, "p1");
+    assert.equal(receivedLine.hasSessionKey, true);
+    assert.equal(receivedLine.contentLength, secret.length);
+    const preprocessedLine = JSON.parse(probeLines[1].replace(/^.*message_preprocessed /, ""));
+    assert.equal(preprocessedLine.isGroup, false);
+    assert.equal(preprocessedLine.bodyLooksLikeMediaPlaceholder, true);
+    assert.equal(preprocessedLine.bodyLength, "[Audio] placeholder body".length);
+
+    assert.ok(logged.every((line) => !line.includes(secret)));
+    assert.ok(logged.every((line) => !line.includes("placeholder body")));
+    assert.throws(() => readdirSync(join(root, "inbox")), /ENOENT/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("tool-discovery registers declared factories without live hooks or token reads", () => {
   const root = join(process.cwd(), ".simai-plugin-does-not-need-to-exist");
   const runtime = mockApi(pluginConfig(root, join(root, "missing.sock")), "tool-discovery");

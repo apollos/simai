@@ -41,6 +41,11 @@
     "correlationWindowMs": {
       "label": "消息关联窗口（毫秒）",
       "advanced": true
+    },
+    "probeMode": {
+      "label": "部署探针模式",
+      "help": "只记录消息身份元数据（不含正文）并完全停用捕获，用于上线前确认真实的 channel/account/sender 字段值。",
+      "advanced": true
     }
   },
   "configSchema": {
@@ -80,6 +85,9 @@
         "type": "integer",
         "minimum": 1000,
         "maximum": 1800000
+      },
+      "probeMode": {
+        "type": "boolean"
       },
       "bindings": {
         "type": "array",

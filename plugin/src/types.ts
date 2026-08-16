@@ -144,6 +144,12 @@ export interface SimaiPluginConfig {
   inboxDir: string;
   /** Maximum lifetime of a two-phase correlation and tool authorization. */
   correlationWindowMs?: number;
+  /**
+   * Deployment probe: log identity metadata (never message bodies) for every
+   * hook invocation and disable capture entirely. Used to discover the real
+   * channel/account/sender/conversation field values before enabling bindings.
+   */
+  probeMode?: boolean;
   bindings: SimaiBinding[];
 }
 
