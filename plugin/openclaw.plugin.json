@@ -133,6 +133,9 @@
             },
             "enabled": {
               "type": "boolean"
+            },
+            "allowMissingIdentity": {
+              "type": "boolean"
             }
           }
         }

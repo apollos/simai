@@ -1,6 +1,13 @@
 /** Simai native plugin for OpenClaw 2026.7.1. */
 
-import { CorrelationStore, matchBinding, normalizeSenderKey } from "./identity.js";
+import {
+  CorrelationStore,
+  matchBinding,
+  normalizeSenderKey,
+  ownerFallbackBinding,
+} from "./identity.js";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
 import { submitWithEncryptedFallback, type InboxSubmission } from "./inbox.js";
 import { SimaiCoreClient } from "./core.js";
 import { readOwnerOnlyToken } from "./credentials.js";
@@ -31,8 +38,31 @@ const plugin: OpenClawPluginDefinition = {
 
 export default plugin;
 
+/**
+ * The gateway registers the plugin several times inside one process (per
+ * agent/run plus tool discovery), and hooks and tool calls can land on
+ * different registrations. Correlation and session state must therefore be
+ * process-global, not per-registration.
+ */
+let sharedCorrelations: { windowMs: number; store: CorrelationStore } | undefined;
+const sharedVerifiedSessions = new Map<string, VerifiedIdentity>();
+const sharedDrivingMode = new Set<string>();
+const sharedRecentlyCaptured = new Map<string, number>();
+
+/** Test isolation only. */
+export function resetSimaiSharedState(): void {
+  sharedCorrelations = undefined;
+  sharedVerifiedSessions.clear();
+  sharedDrivingMode.clear();
+  sharedRecentlyCaptured.clear();
+}
+
 function registerSimai(api: OpenClawPluginApi): void {
   const config = parsePluginConfig(api.pluginConfig);
+  // Distinguishes plugin instances in logs: the host may register the plugin
+  // several times (gateway + per-run), and in-memory correlation only works
+  // when both hooks and the tool call land on the same instance.
+  const instanceId = Math.random().toString(36).slice(2, 8);
   const probeMode = config.probeMode === true;
   const enabledBindings = probeMode
     ? []
@@ -43,24 +73,38 @@ function registerSimai(api: OpenClawPluginApi): void {
     api.logger.info(`simai[probe] ${hook} ${JSON.stringify(fields)}`);
   };
   const correlationWindowMs = config.correlationWindowMs ?? DEFAULT_CORRELATION_WINDOW_MS;
-  const correlations = new CorrelationStore(correlationWindowMs);
-  const verifiedSessions = new Map<string, VerifiedIdentity>();
-  const drivingMode = new Set<string>();
+  if (!sharedCorrelations || sharedCorrelations.windowMs !== correlationWindowMs) {
+    sharedCorrelations = {
+      windowMs: correlationWindowMs,
+      store: new CorrelationStore(correlationWindowMs),
+    };
+  }
+  const correlations = sharedCorrelations.store;
+  const verifiedSessions = sharedVerifiedSessions;
+  const drivingMode = sharedDrivingMode;
   let core: SimaiCoreClient | undefined;
+
+  // Never rely on a host-provided path helper: real gateways may lack
+  // api.resolvePath or return nothing for absolute inputs.
+  const expandPath = (input: string): string => {
+    if (input === "~") return homedir();
+    if (input.startsWith("~/")) return join(homedir(), input.slice(2));
+    return isAbsolute(input) ? input : resolve(input);
+  };
 
   const submitEncrypted = (item: InboxSubmission): Promise<boolean> =>
     submitWithEncryptedFallback(
-      api.resolvePath(config.inboxSocket),
+      expandPath(config.inboxSocket),
       {
-        vaultHeaderPath: api.resolvePath(config.vaultHeaderPath),
-        inboxDir: api.resolvePath(config.inboxDir),
+        vaultHeaderPath: expandPath(config.vaultHeaderPath),
+        inboxDir: expandPath(config.inboxDir),
       },
       item,
     );
 
   const getCore = (): SimaiCoreClient => {
     if (core) return core;
-    const tokenPath = api.resolvePath(config.coreTokenFile);
+    const tokenPath = expandPath(config.coreTokenFile);
     const coreToken = readOwnerOnlyToken(tokenPath);
     core = new SimaiCoreClient(config.coreUrl.replace(/\/$/, ""), coreToken);
     return core;
@@ -78,30 +122,61 @@ function registerSimai(api: OpenClawPluginApi): void {
     // Deny logs carry identity metadata only (never message content) so a
     // rejected tool call can be diagnosed from the gateway log.
     const deny = (reason: string): null => {
-      api.logger.warn(`simai: tool auth denied reason=${reason}`);
+      api.logger.warn(`simai: tool auth denied reason=${reason} instance=${instanceId}`);
       return null;
     };
+    api.logger.info(
+      `simai: tool auth ctx instance=${instanceId} channel=${ctx.messageChannel ?? "<none>"} ` +
+        `account=${ctx.agentAccountId ?? "<none>"} requester=${ctx.requesterSenderId ?? "<none>"} ` +
+        `to=${ctx.deliveryContext?.to ?? "<none>"} hasSession=${Boolean(ctx.sessionKey)} ` +
+        `owner=${String(ctx.senderIsOwner)}`,
+    );
     if (!ctx.sessionKey) return deny("missing_session_key");
-    if (!ctx.requesterSenderId) return deny("missing_requester_sender");
     if (ctx.senderIsOwner === false) return deny("sender_not_owner");
     const identity = verifiedSessions.get(ctx.sessionKey);
     if (!identity) return deny("session_not_correlated");
     if (Date.now() - identity.receivedAt > correlationWindowMs) return deny("correlation_expired");
+    const binding = enabledBindings.find((item) => item.id === identity.bindingId);
+    if (!binding) return deny("binding_disabled");
+    // Owner-only channels (allowMissingIdentity) legitimately omit ambient
+    // identity in the tool context; present fields must still match exactly.
+    const lax = binding.allowMissingIdentity === true;
 
     const channel = exactAmbient(ctx.messageChannel, ctx.deliveryContext?.channel);
     const accountId = exactAmbient(ctx.agentAccountId, ctx.deliveryContext?.accountId);
-    if (!channel || !accountId) return deny("ambiguous_channel_or_account");
-    if (channel !== identity.channel || accountId !== identity.accountId) {
-      return deny(`channel_or_account_mismatch got=${channel}/${accountId}`);
+    if (conflicts(ctx.messageChannel, ctx.deliveryContext?.channel)) {
+      return deny("ambiguous_channel");
     }
-    if (ctx.requesterSenderId !== identity.senderKey) {
-      return deny(`sender_mismatch got=${ctx.requesterSenderId}`);
+    if (conflicts(ctx.agentAccountId, ctx.deliveryContext?.accountId)) {
+      return deny("ambiguous_account");
     }
-    if (
-      identity.conversationId !== null &&
-      ctx.deliveryContext?.to !== identity.conversationId
+    if (channel) {
+      if (channel !== identity.channel) return deny(`channel_mismatch got=${channel}`);
+    } else if (!lax) {
+      return deny("missing_channel");
+    }
+    if (accountId) {
+      if (accountId !== identity.accountId) return deny(`account_mismatch got=${accountId}`);
+    } else if (!lax) {
+      return deny("missing_account");
+    }
+    if (ctx.requesterSenderId) {
+      if (ctx.requesterSenderId !== identity.senderKey) {
+        return deny(`sender_mismatch got=${ctx.requesterSenderId}`);
+      }
+    } else if (
+      !lax &&
+      !(identity.conversationId !== null && ctx.deliveryContext?.to === identity.conversationId)
     ) {
-      return deny(`conversation_mismatch got=${ctx.deliveryContext?.to ?? "<none>"}`);
+      // The host does not always forward a requester id. Accept the omission
+      // only when the delivery target is exactly the bound private
+      // conversation, which the correlated session already pinned.
+      return deny("missing_requester_sender");
+    }
+    if (identity.conversationId !== null && ctx.deliveryContext?.to !== identity.conversationId) {
+      if (!(lax && ctx.deliveryContext?.to === undefined)) {
+        return deny(`conversation_mismatch got=${ctx.deliveryContext?.to ?? "<none>"}`);
+      }
     }
     return identity;
   };
@@ -123,12 +198,32 @@ function registerSimai(api: OpenClawPluginApi): void {
     body,
   });
 
+  // The host can deliver both hooks more than once for the same message;
+  // capture each correlated message at most once per window.
+  const recentlyCaptured = sharedRecentlyCaptured;
+  const alreadyCaptured = (matched: VerifiedIdentity): boolean => {
+    const now = Date.now();
+    for (const [key, at] of recentlyCaptured) {
+      if (now - at > correlationWindowMs) recentlyCaptured.delete(key);
+    }
+    const key = `${matched.bindingId}\u0000${matched.messageId}`;
+    if (recentlyCaptured.has(key)) return true;
+    recentlyCaptured.set(key, now);
+    return false;
+  };
+
   const handleMatched = async (
     matched: VerifiedIdentity & { body: string },
   ): Promise<void> => {
     rememberVerified(matched);
     const body = matched.body.trim();
     if (!body) return;
+    if (alreadyCaptured(matched)) {
+      api.logger.info(
+        `simai: duplicate correlation ignored messageId=${matched.messageId}`,
+      );
+      return;
+    }
 
     if (DRIVING_ON.test(body)) {
       drivingMode.add(matched.bindingId);
@@ -199,18 +294,28 @@ function registerSimai(api: OpenClawPluginApi): void {
         conversationId: ctx.conversationId ?? null,
       };
       const binding = matchBinding(enabledBindings, source, { allowUnknownGroup: true });
-      if (!binding || !messageId || !senderKey || !ctx.accountId) return;
+      if (!binding || !messageId) return;
+      const lax = binding.allowMissingIdentity === true;
+      const effectiveSender = senderKey ?? (lax ? binding.senderKey : undefined);
+      const effectiveAccount = ctx.accountId ?? (lax ? binding.accountId : undefined);
+      const effectiveConversation =
+        ctx.conversationId ?? (lax ? binding.conversationId ?? null : null);
+      if (!effectiveSender || !effectiveAccount) return;
 
       const matched = correlations.addEnvelope({
         binding,
         channel: ctx.channelId,
-        accountId: ctx.accountId,
-        senderKey,
-        conversationId: ctx.conversationId ?? null,
+        accountId: effectiveAccount,
+        senderKey: effectiveSender,
+        conversationId: effectiveConversation,
         messageId,
         sessionKey,
         receivedAt: Date.now(),
       });
+      api.logger.info(
+        `simai: hook envelope instance=${instanceId} binding=${binding.id} ` +
+          `messageId=${messageId} matched=${Boolean(matched)}`,
+      );
       if (matched) await handleMatched(matched);
     });
 
@@ -236,21 +341,33 @@ function registerSimai(api: OpenClawPluginApi): void {
           return;
         }
         const body = event.context.bodyForAgent;
-        const senderKey = normalizeSenderKey({
+        let senderKey = normalizeSenderKey({
           senderId: event.context.senderId,
           from: event.context.from,
         });
+        let conversationId = event.context.conversationId ?? null;
+        if (!senderKey) {
+          const fallback = ownerFallbackBinding(enabledBindings, event.context.channelId);
+          if (fallback) {
+            senderKey = fallback.senderKey;
+            conversationId = conversationId ?? fallback.conversationId ?? null;
+          }
+        }
         if (!body?.trim() || !senderKey) return;
         const matched = correlations.addBody({
           body,
           channel: event.context.channelId,
           senderKey,
-          conversationId: event.context.conversationId ?? null,
+          conversationId,
           isGroup: event.context.isGroup,
           messageId: event.context.messageId,
           sessionKey: event.sessionKey,
           receivedAt: Date.now(),
         });
+        api.logger.info(
+          `simai: hook body instance=${instanceId} ` +
+            `messageId=${event.context.messageId ?? "<none>"} matched=${Boolean(matched)}`,
+        );
         if (matched) await handleMatched(matched);
       },
       {
@@ -266,6 +383,7 @@ function registerSimai(api: OpenClawPluginApi): void {
 
   api.logger.info(
     `simai plugin registered mode=${api.registrationMode} bindings=${enabledBindings.length}` +
+      ` instance=${instanceId}` +
       (probeMode ? " probeMode=on (capture disabled, metadata-only logging)" : ""),
   );
 }
@@ -492,6 +610,12 @@ function parseBinding(raw: unknown, index: number): SimaiBinding {
     }
     return value[key] as boolean;
   };
+  if (
+    value.allowMissingIdentity !== undefined &&
+    typeof value.allowMissingIdentity !== "boolean"
+  ) {
+    throw new Error(`simai: bindings[${index}].allowMissingIdentity must be boolean`);
+  }
   return {
     id: requiredString(value, "id"),
     channel: requiredString(value, "channel"),
@@ -503,6 +627,9 @@ function parseBinding(raw: unknown, index: number): SimaiBinding {
     allowGroup: bool("allowGroup"),
     passiveCapture: bool("passiveCapture"),
     enabled: bool("enabled"),
+    ...(value.allowMissingIdentity === undefined
+      ? {}
+      : { allowMissingIdentity: value.allowMissingIdentity as boolean }),
   };
 }
 

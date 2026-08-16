@@ -103,7 +103,8 @@ export interface OpenClawPluginApi {
     warn(message: string): void;
     error(message: string): void;
   };
-  resolvePath(input: string): string;
+  /** Optional host helper; real gateways may not provide it. */
+  resolvePath?(input: string): string;
   on(
     event: "message_received",
     handler: (
@@ -162,6 +163,13 @@ export interface SimaiBinding {
   allowGroup: boolean;
   passiveCapture: boolean;
   enabled: boolean;
+  /**
+   * Owner-only channel mode (e.g. the loopback dashboard "webchat"): when the
+   * payload carries no account/sender identity at all, assume the identity
+   * configured on this binding. Fields that are present must still match
+   * exactly. Never enable this for channels with real multi-user identities.
+   */
+  allowMissingIdentity?: boolean;
 }
 
 export type CaptureMode = "passive" | "explicit";

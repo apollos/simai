@@ -61,7 +61,13 @@ openclaw plugins install /opt/simai/plugin
 
 同一个 binding 的 `id/channel/accountId/senderKey/conversationId/allowGroup` 必须与
 思脉 YAML 中的 `source_bindings` 完全一致。插件与 Python ingress 都会核验身份；
-未知来源、歧义配置、群聊或关联字段冲突一律拒绝。`sessionKey` 只用于同一轮工具
+未知来源、歧义配置、群聊或关联字段冲突一律拒绝。
+
+仅所有者可访问的本地通道（如 loopback Dashboard 的 `webchat`）不携带任何
+account/sender 身份字段。对这类通道可在 binding 上显式设置
+`allowMissingIdentity: true`：当载荷完全缺失身份字段时，用 binding 配置的身份
+填充信封（Python 侧核验不变）；载荷中任何存在但不匹配的字段仍然拒绝。
+同一通道只允许一个此类 binding，歧义时不捕获。严禁对微信等真实多用户通道启用。`sessionKey` 只用于同一轮工具
 授权；预处理 hook 没有 sessionKey 时，仍可通过 messageId 和完整消息身份关联。
 
 正常写入走 0600 Unix Socket。Socket/Core 短暂不可用时，插件读取

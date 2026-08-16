@@ -68,23 +68,51 @@ export function matchBinding(
   options: MatchBindingOptions = {},
 ): SimaiBinding | null {
   const senderKey = normalizeSenderKey(input);
-  if (!input.channel || !input.accountId || !senderKey) return null;
+  if (!input.channel) return null;
   if (typeof input.isGroup !== "boolean" && !options.allowUnknownGroup) return null;
 
   const matches = bindings.filter((binding) => {
     if (!binding.enabled) return false;
     if (binding.channel !== input.channel) return false;
-    if (binding.accountId !== input.accountId) return false;
-    if (binding.senderKey !== senderKey) return false;
-    if (
-      binding.conversationId !== undefined &&
-      binding.conversationId !== (input.conversationId ?? undefined)
-    ) {
+    const lax = binding.allowMissingIdentity === true;
+    // Present fields must always match exactly; absent fields are acceptable
+    // only on explicit owner-only (allowMissingIdentity) bindings.
+    if (input.accountId) {
+      if (binding.accountId !== input.accountId) return false;
+    } else if (!lax) {
+      return false;
+    }
+    if (senderKey) {
+      if (binding.senderKey !== senderKey) return false;
+    } else if (!lax) {
+      return false;
+    }
+    if (input.conversationId != null) {
+      if (binding.conversationId !== undefined && binding.conversationId !== input.conversationId) {
+        return false;
+      }
+    } else if (binding.conversationId !== undefined && !lax) {
       return false;
     }
     if (input.isGroup === true && !binding.allowGroup) return false;
     return true;
   });
+  return matches.length === 1 ? matches[0] : null;
+}
+
+/**
+ * The single owner-only binding that may serve an identity-less payload on
+ * this channel; ambiguous configurations fail closed.
+ */
+export function ownerFallbackBinding(
+  bindings: SimaiBinding[],
+  channel: string | undefined,
+): SimaiBinding | null {
+  if (!channel) return null;
+  const matches = bindings.filter(
+    (binding) =>
+      binding.enabled && binding.allowMissingIdentity === true && binding.channel === channel,
+  );
   return matches.length === 1 ? matches[0] : null;
 }
 

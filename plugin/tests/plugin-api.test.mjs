@@ -4,7 +4,11 @@ import { join } from "node:path";
 import test from "node:test";
 import sodium from "libsodium-wrappers";
 
-import plugin from "../dist/index.js";
+import plugin, { resetSimaiSharedState } from "../dist/index.js";
+
+// Correlation state is intentionally process-global (the gateway registers
+// the plugin several times per process); isolate it between tests.
+test.beforeEach(() => resetSimaiSharedState());
 
 const binding = {
   id: "yu_weixin",
@@ -300,6 +304,131 @@ test("2026.7.1 hooks correlate exact identity and tools use factory/execute", as
     received = readEnvelopes(root, keypair);
     assert.equal(received.find((item) => item.body === "普通聊天").capture_mode, "passive");
     assert.equal(received.find((item) => item.body === "Core 故障时也不能丢").capture_mode, "explicit");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("webchat owner binding captures identity-less payloads and authorizes tools", async () => {
+  const root = mkdtempSync(join(process.cwd(), ".simai-plugin-webchat-"));
+  try {
+    await sodium.ready;
+    const keypair = sodium.crypto_box_keypair();
+    writeFileSync(join(root, "vault.header.json"), JSON.stringify({
+      format_version: 1,
+      sealed_inbox_public_key: Buffer.from(keypair.publicKey).toString("base64"),
+    }), { mode: 0o600 });
+    writeFileSync(join(root, "plugin.token"), "x".repeat(32), { mode: 0o600 });
+    const webBinding = {
+      id: "local_web",
+      channel: "webchat",
+      accountId: "local",
+      senderKey: "local-owner",
+      conversationId: "local-web",
+      allowGroup: false,
+      passiveCapture: true,
+      enabled: true,
+      allowMissingIdentity: true,
+    };
+    const config = {
+      ...pluginConfig(root, join(root, "inbox.sock")),
+      bindings: [webBinding],
+    };
+    const runtime = mockApi(config);
+    plugin.register(runtime.api);
+
+    const receive = runtime.typedHooks.get("message_received");
+    const preprocess = runtime.internalHooks.get("message:preprocessed").handler;
+    // Dashboard payload observed in the real host: identity fields all absent.
+    await receive(
+      { from: "", content: "测试一下", messageId: "w1", sessionKey: "ws1" },
+      { channelId: "webchat", messageId: "w1", sessionKey: "ws1" },
+    );
+    await preprocess({
+      type: "message",
+      action: "preprocessed",
+      sessionKey: "ws1",
+      messages: [],
+      context: {
+        bodyForAgent: "测试一下",
+        from: "",
+        channelId: "webchat",
+        messageId: "w1",
+        isGroup: false,
+      },
+    });
+    const received = readEnvelopes(root, keypair);
+    const item = received.find((entry) => entry.body === "测试一下");
+    assert.equal(item.binding_id, "local_web");
+    assert.equal(item.account_id, "local");
+    assert.equal(item.sender_key, "local-owner");
+    assert.equal(item.conversation_id, "local-web");
+    assert.equal(item.capture_mode, "passive");
+
+    // Hosts can replay both hooks for the same message; it must seal once.
+    await receive(
+      { from: "", content: "测试一下", messageId: "w1", sessionKey: "ws1" },
+      { channelId: "webchat", messageId: "w1", sessionKey: "ws1" },
+    );
+    await preprocess({
+      type: "message",
+      action: "preprocessed",
+      sessionKey: "ws1",
+      messages: [],
+      context: {
+        bodyForAgent: "测试一下",
+        from: "",
+        channelId: "webchat",
+        messageId: "w1",
+        isGroup: false,
+      },
+    });
+    assert.equal(
+      readEnvelopes(root, keypair).filter((entry) => entry.body === "测试一下").length,
+      1,
+    );
+
+    // Tool context in the real host is equally identity-less for webchat.
+    const captureRegistration = runtime.tools.find(({ options }) =>
+      options.names.includes("simai_capture"));
+    const tool = captureRegistration.factory({
+      sessionKey: "ws1",
+      messageChannel: "webchat",
+      senderIsOwner: true,
+    });
+    const result = await tool.execute("call-web-1", { text: "网页想法" });
+    // Core is unreachable in this test, so the encrypted fallback answers.
+    assert.match(JSON.stringify(result.details), /待确认箱/);
+
+    // A strict binding must still reject identity-less payloads.
+    const strictRuntime = mockApi({
+      ...pluginConfig(root, join(root, "inbox.sock")),
+      bindings: [{ ...webBinding, id: "strict_web", allowMissingIdentity: false }],
+    });
+    plugin.register(strictRuntime.api);
+    const strictReceive = strictRuntime.typedHooks.get("message_received");
+    const strictPreprocess = strictRuntime.internalHooks.get("message:preprocessed").handler;
+    await strictReceive(
+      { from: "", content: "不该被捕获", messageId: "w2", sessionKey: "ws2" },
+      { channelId: "webchat", messageId: "w2", sessionKey: "ws2" },
+    );
+    await strictPreprocess({
+      type: "message",
+      action: "preprocessed",
+      sessionKey: "ws2",
+      messages: [],
+      context: {
+        bodyForAgent: "不该被捕获",
+        from: "",
+        channelId: "webchat",
+        messageId: "w2",
+        isGroup: false,
+      },
+    });
+    assert.equal(
+      readEnvelopes(root, keypair).some((entry) => entry.body === "不该被捕获"),
+      false,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
