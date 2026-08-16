@@ -14,20 +14,17 @@
 
 ---
 
-## 第 1 步：上传并安装 Plugin（门槛 1）
+## 第 1 步：同步并安装 Plugin（门槛 1）
 
-本地（WSL）已完成构建与 16 项测试。同步到云上：
-
-~~~bash
-# 本地执行
-rsync -av --exclude node_modules ~/workspace/simai/plugin/ 云主机:~/workspace/simai/plugin/
-~~~
-
-云上安装运行时依赖并注册插件：
+本地（WSL）已完成构建与 16 项测试，`git push` 后在云上拉取。
+注意 `plugin/dist/` 不进 git，云端需要自己构建（锁文件已含 typescript）：
 
 ~~~bash
-cd ~/workspace/simai/plugin
-npm ci --omit=dev --registry=https://registry.npmmirror.com
+cd ~/workspace/simai && git pull
+cd plugin
+npm ci --registry=https://registry.npmmirror.com   # 含 dev 依赖，构建需要
+npm run build                                       # 生成 dist/
+npm prune --omit=dev                                # 可选：构建后移除 dev 依赖
 openclaw plugins install ~/workspace/simai/plugin
 ~~~
 
