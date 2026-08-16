@@ -75,21 +75,33 @@ function registerSimai(api: OpenClawPluginApi): void {
   };
 
   const authorizeTool = (ctx: OpenClawPluginToolContext): VerifiedIdentity | null => {
-    if (!ctx.sessionKey || !ctx.requesterSenderId) return null;
-    if (ctx.senderIsOwner === false) return null;
+    // Deny logs carry identity metadata only (never message content) so a
+    // rejected tool call can be diagnosed from the gateway log.
+    const deny = (reason: string): null => {
+      api.logger.warn(`simai: tool auth denied reason=${reason}`);
+      return null;
+    };
+    if (!ctx.sessionKey) return deny("missing_session_key");
+    if (!ctx.requesterSenderId) return deny("missing_requester_sender");
+    if (ctx.senderIsOwner === false) return deny("sender_not_owner");
     const identity = verifiedSessions.get(ctx.sessionKey);
-    if (!identity || Date.now() - identity.receivedAt > correlationWindowMs) return null;
+    if (!identity) return deny("session_not_correlated");
+    if (Date.now() - identity.receivedAt > correlationWindowMs) return deny("correlation_expired");
 
     const channel = exactAmbient(ctx.messageChannel, ctx.deliveryContext?.channel);
     const accountId = exactAmbient(ctx.agentAccountId, ctx.deliveryContext?.accountId);
-    if (!channel || !accountId) return null;
-    if (channel !== identity.channel || accountId !== identity.accountId) return null;
-    if (ctx.requesterSenderId !== identity.senderKey) return null;
+    if (!channel || !accountId) return deny("ambiguous_channel_or_account");
+    if (channel !== identity.channel || accountId !== identity.accountId) {
+      return deny(`channel_or_account_mismatch got=${channel}/${accountId}`);
+    }
+    if (ctx.requesterSenderId !== identity.senderKey) {
+      return deny(`sender_mismatch got=${ctx.requesterSenderId}`);
+    }
     if (
       identity.conversationId !== null &&
       ctx.deliveryContext?.to !== identity.conversationId
     ) {
-      return null;
+      return deny(`conversation_mismatch got=${ctx.deliveryContext?.to ?? "<none>"}`);
     }
     return identity;
   };
@@ -135,6 +147,10 @@ function registerSimai(api: OpenClawPluginApi): void {
         api.logger.warn(
           `simai: driving-mode sealed inbox submission failed binding=${matched.bindingId}`,
         );
+      } else {
+        api.logger.info(
+          `simai: explicit capture sealed binding=${matched.bindingId} messageId=${matched.messageId}`,
+        );
       }
       return;
     }
@@ -142,7 +158,13 @@ function registerSimai(api: OpenClawPluginApi): void {
     const binding = enabledBindings.find((item) => item.id === matched.bindingId);
     if (!binding?.passiveCapture) return;
     const ok = await submitEncrypted(inboxItem(matched, matched.body, "passive"));
-    if (!ok) api.logger.warn(`simai: sealed inbox submission failed binding=${matched.bindingId}`);
+    if (!ok) {
+      api.logger.warn(`simai: sealed inbox submission failed binding=${matched.bindingId}`);
+    } else {
+      api.logger.info(
+        `simai: passive capture sealed binding=${matched.bindingId} messageId=${matched.messageId}`,
+      );
+    }
   };
 
   if (api.registrationMode === "full") {
