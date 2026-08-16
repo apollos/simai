@@ -22,8 +22,13 @@ import type {
   VerifiedIdentity,
 } from "./types.js";
 
-const DRIVING_ON = /^(?:我(?:现在)?在开车|进入驾驶模式)(?:[，,、；;：:\s]*(?:接下来)?(?:请)?(?:只记录|只帮我记录|不要回复|不需要回复))?[。！!]?$/;
-const DRIVING_OFF = /^(?:结束|退出)驾驶模式[。！!]?$|^(?:我)?(?:已经)?(?:停车了|不开车了)[。！!]?$/;
+// Dictation ("driving") mode: sticky verbatim capture with no model filtering.
+// Triggers are anchored full-sentence matches so ordinary chat never toggles
+// the mode by accident.
+const DRIVING_ON =
+  /^(?:我(?:现在)?在开车|进入(?:驾驶|速记|记录)模式|开始(?:速记|记录)|我有(?:个|一些)?想法[，,、；;：:\s]*(?:请|帮我)?(?:只)?记录)(?:[，,、；;：:\s]*(?:接下来)?(?:请)?(?:只记录|只帮我记录|不要回复|不需要回复))?[。！!]?$/;
+const DRIVING_OFF =
+  /^(?:结束|退出|停止)(?:驾驶|速记|记录)模式[。！!]?$|^(?:我)?(?:已经)?(?:停车了|不开车了)[。！!]?$|^记录(?:完毕|结束)[。！!]?$|^(?:结束|停止)记录[。！!]?$/;
 const DEFAULT_CORRELATION_WINDOW_MS = 5 * 60 * 1000;
 
 const plugin: OpenClawPluginDefinition = {
@@ -221,6 +226,9 @@ function registerSimai(api: OpenClawPluginApi): void {
     rememberVerified(matched);
     const body = matched.body.trim();
     if (!body) return;
+    // Host commands ("/reset", "/help", ...) are operator instructions, never
+    // thoughts; keep them out of the sealed inbox in every capture mode.
+    if (body.startsWith("/")) return;
     if (alreadyCaptured(matched)) {
       api.logger.info(
         `simai: duplicate correlation ignored messageId=${matched.messageId}`,

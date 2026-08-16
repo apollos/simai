@@ -436,6 +436,69 @@ test("webchat owner binding captures identity-less payloads and authorizes tools
     assert.equal(item.conversation_id, "local-web");
     assert.equal(item.capture_mode, "passive");
 
+    // Dictation-mode aliases: "开始记录" ... "记录完毕" toggle explicit capture.
+    const dictate = async (text, id, session) => {
+      await receive(
+        { from: "", content: text, messageId: id, sessionKey: session },
+        { channelId: "webchat", messageId: id, sessionKey: session },
+      );
+      await preprocess({
+        type: "message",
+        action: "preprocessed",
+        sessionKey: session,
+        messages: [],
+        context: {
+          bodyForAgent: text,
+          from: "",
+          channelId: "webchat",
+          messageId: id,
+          isGroup: false,
+        },
+      });
+    };
+    await dictate("开始记录", "w3", "ws3");
+    await dictate("速记模式下的想法", "w4", "ws4");
+    await dictate("记录完毕", "w5", "ws5");
+    const dictated = readEnvelopes(root, keypair).find(
+      (entry) => entry.body === "速记模式下的想法",
+    );
+    assert.equal(dictated.capture_mode, "explicit");
+    assert.equal(
+      readEnvelopes(root, keypair).some(
+        (entry) => entry.body === "开始记录" || entry.body === "记录完毕",
+      ),
+      false,
+    );
+    // Mode is off again afterwards: new messages fall back to passive capture.
+    await dictate("恢复被动的消息", "w6", "ws6");
+    assert.equal(
+      readEnvelopes(root, keypair).find((entry) => entry.body === "恢复被动的消息").capture_mode,
+      "passive",
+    );
+
+    // Slash commands are operator instructions and must never be captured.
+    await receive(
+      { from: "", content: "/reset", messageId: "w9", sessionKey: "ws9" },
+      { channelId: "webchat", messageId: "w9", sessionKey: "ws9" },
+    );
+    await preprocess({
+      type: "message",
+      action: "preprocessed",
+      sessionKey: "ws9",
+      messages: [],
+      context: {
+        bodyForAgent: "/reset",
+        from: "",
+        channelId: "webchat",
+        messageId: "w9",
+        isGroup: false,
+      },
+    });
+    assert.equal(
+      readEnvelopes(root, keypair).some((entry) => entry.body === "/reset"),
+      false,
+    );
+
     // Hosts can replay both hooks for the same message; it must seal once.
     await receive(
       { from: "", content: "测试一下", messageId: "w1", sessionKey: "ws1" },
