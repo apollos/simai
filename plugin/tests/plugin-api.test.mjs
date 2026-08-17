@@ -201,6 +201,11 @@ test("2026.7.1 hooks correlate exact identity and tools use factory/execute", as
       (entry) => entry.body === "这是驾驶期间直接说出的想法",
     );
     assert.equal(directDriving.capture_mode, "explicit");
+    // Everything inside one dictation session shares one dictation_id so the
+    // core can merge the session into a single topic candidate.
+    assert.equal(typeof directDriving.dictation_id, "string");
+    assert.ok(directDriving.dictation_id.length > 0);
+    assert.equal(received.find((item) => item.body === "语音转写后的思想").dictation_id, null);
     assert.equal(
       received.some((entry) => entry.body === "我在开车，接下来只记录"),
       false,
@@ -231,10 +236,66 @@ test("2026.7.1 hooks correlate exact identity and tools use factory/execute", as
     assert.equal(driving.sender_key, binding.senderKey);
     assert.equal(driving.conversation_id, binding.conversationId);
     assert.equal(driving.is_group, false);
+    assert.equal(driving.dictation_id, directDriving.dictation_id);
 
     const deniedTool = captureRegistration.factory({ sessionKey: "s2" });
     const denied = await deniedTool.execute("call-2", { text: "must not pass" });
     assert.match(denied.details.error, /not whitelisted/);
+
+    // While the dictation session is on, delivered assistant replies are also
+    // sealed (speaker=assistant, same session id) so the daily merge can keep
+    // the assistant points the owner explicitly endorsed.
+    const sent = runtime.typedHooks.get("message_sent");
+    assert.equal(typeof sent, "function");
+    await sent(
+      {
+        to: binding.conversationId,
+        content: "建议同时考虑密钥轮换的频率",
+        success: true,
+        messageId: "reply-1",
+        sessionKey: "s2",
+      },
+      {
+        channelId: binding.channel,
+        accountId: binding.accountId,
+        conversationId: binding.conversationId,
+      },
+    );
+    // Duplicate delivery of the same reply must seal exactly once.
+    await sent(
+      {
+        to: binding.conversationId,
+        content: "建议同时考虑密钥轮换的频率",
+        success: true,
+        messageId: "reply-1",
+        sessionKey: "s2",
+      },
+      {
+        channelId: binding.channel,
+        accountId: binding.accountId,
+        conversationId: binding.conversationId,
+      },
+    );
+    // Failed deliveries and other conversations are never sealed.
+    await sent(
+      { to: binding.conversationId, content: "发送失败的回复", success: false, messageId: "reply-2" },
+      { channelId: binding.channel, accountId: binding.accountId },
+    );
+    await sent(
+      { to: "other@conversation", content: "别的会话的回复", success: true, messageId: "reply-3" },
+      { channelId: binding.channel, accountId: binding.accountId },
+    );
+    received = readEnvelopes(root, keypair);
+    const assistantReplies = received.filter(
+      (entry) => entry.body === "建议同时考虑密钥轮换的频率",
+    );
+    assert.equal(assistantReplies.length, 1);
+    assert.equal(assistantReplies[0].speaker, "assistant");
+    assert.equal(assistantReplies[0].capture_mode, "explicit");
+    assert.equal(assistantReplies[0].dictation_id, directDriving.dictation_id);
+    assert.equal(directDriving.speaker, "owner");
+    assert.equal(received.some((entry) => entry.body === "发送失败的回复"), false);
+    assert.equal(received.some((entry) => entry.body === "别的会话的回复"), false);
 
     // Leave driving mode, correlate another exact turn, then prove that a Core
     // connection failure is encrypted as explicit instead of being lost.
@@ -303,7 +364,27 @@ test("2026.7.1 hooks correlate exact identity and tools use factory/execute", as
     assert.match(unavailable.details.status, /加密放入待确认箱/);
     received = readEnvelopes(root, keypair);
     assert.equal(received.find((item) => item.body === "普通聊天").capture_mode, "passive");
-    assert.equal(received.find((item) => item.body === "Core 故障时也不能丢").capture_mode, "explicit");
+    const afterSession = received.find((item) => item.body === "Core 故障时也不能丢");
+    assert.equal(afterSession.capture_mode, "explicit");
+    // The session ended with 不开车了: later explicit fallbacks carry no session id.
+    assert.equal(afterSession.dictation_id, null);
+    // Outside a dictation session, assistant replies are never sealed.
+    await sent(
+      {
+        to: binding.conversationId,
+        content: "会话结束后的回复",
+        success: true,
+        messageId: "reply-4",
+        sessionKey: "s4",
+      },
+      {
+        channelId: binding.channel,
+        accountId: binding.accountId,
+        conversationId: binding.conversationId,
+      },
+    );
+    received = readEnvelopes(root, keypair);
+    assert.equal(received.some((entry) => entry.body === "会话结束后的回复"), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

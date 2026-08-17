@@ -24,7 +24,7 @@ from datetime import UTC, datetime, timedelta
 from ..crypto import sealed_inbox
 from ..db.engine import now_iso
 from ..llm.client import ModelError, OpenClawClient
-from ..llm.schemas import DailyExtractResult
+from ..llm.schemas import DailyExtractResult, DictationMergeResult
 from . import capture, ids
 from .state import AppState
 
@@ -47,6 +47,30 @@ one input message and `source_message_no` must be that message's displayed
 number. Be conservative: when unsure, do not extract.
 Messages are numbered; treat each independently unless they clearly
 continue one thought.
+"""
+
+DICTATION_SYSTEM = """You compose ONE dictation session of the OWNER's voice/text
+notes into topic candidates for their private thought tree. The input is a
+numbered transcript: [主人] lines are the owner's words; [助手] lines are the
+assistant's replies, provided as context only.
+
+Rules:
+- Default to exactly ONE topic that carries the owner's whole line of thought
+  in the owner's own wording. Light cleanup only (remove fillers/ASR noise);
+  keep numbers, negations, conditions and uncertainty exactly.
+- Split into MULTIPLE topics ONLY when the owner explicitly enumerated
+  independent items (e.g. "1." "2.", "第一…第二…", "另外说个不相关的") AND the
+  items are genuinely unrelated. Back-and-forth elaboration of one theme is
+  ONE topic, in spoken order.
+- Assistant content: include a point from a [助手] line ONLY when the owner
+  clearly endorsed it or commented on it in a later [主人] line (e.g. "对",
+  "是的", "没错", "就按这个", or a substantive comment). Weave the endorsed
+  point into the topic content and mark its origin, e.g.
+  "（采纳自助手回复：…）". NEVER include assistant suggestions the owner did
+  not react to, and never present assistant ideas as the owner's own.
+- candidate_type: idea/opinion/decision/question/principle/hypothesis/insight/
+  risk/method.
+- Do not invent facts. Respond in Chinese.
 """
 
 
@@ -181,6 +205,19 @@ def _run_daily_locked(state: AppState, client: OpenClawClient) -> dict:
             selected_chars += item_chars
     todo = selected
 
+    # Dictation sessions: all explicit items sharing one dictation_id were
+    # spoken between "开始记录" and "记录完毕" and form ONE line of thought.
+    # They are merged into a single topic candidate instead of one candidate
+    # per voice message.
+    dictation_groups: dict[tuple[str, str], list[tuple[sealed_inbox.InboxItem, str]]] = {}
+    for item, fingerprint in todo:
+        if item.capture_mode == "explicit" and item.dictation_id:
+            key = (item.binding_id, item.dictation_id)
+            dictation_groups.setdefault(key, []).append((item, fingerprint))
+    grouped_fingerprints = {
+        fingerprint for members in dictation_groups.values() for _item, fingerprint in members
+    }
+
     candidates_created = 0
     rechecked_done = 0
     try:
@@ -202,6 +239,16 @@ def _run_daily_locked(state: AppState, client: OpenClawClient) -> dict:
                         entry.capture.normalized_content,
                     )
                 planned.append((entry, owner, placement))
+            # Each dictation session is composed by the model into one topic
+            # (or several, when the owner explicitly enumerated unrelated
+            # items), weaving in assistant points the owner endorsed. A model
+            # outage falls back to the owner's verbatim words - explicit
+            # capture is never lost and never blocked.
+            session_plans: list[tuple[tuple[str, str], list[dict]]] = []
+            for group_key, members in dictation_groups.items():
+                session_plans.append(
+                    (group_key, _plan_dictation_session(state, client, members))
+                )
 
             with state.transaction() as tx:
                 # An explicit Tool capture can finish while the daily model is
@@ -227,13 +274,40 @@ def _run_daily_locked(state: AppState, client: OpenClawClient) -> dict:
                 # Explicit/driving captures express an unambiguous request to
                 # remember.  They must never be discarded by the conservative
                 # passive-chat filter.  Preserve them as editable raw cards.
-                for item, _fingerprint in todo:
-                    if item.capture_mode == "explicit":
+                # Items that belong to a dictation session are handled as one
+                # merged candidate below instead.
+                for item, fingerprint in todo:
+                    if item.capture_mode == "explicit" and fingerprint not in grouped_fingerprints:
                         capture.create_raw_candidate(
                             tx,
                             keys.excerpt_key,
                             item.body,
                             source_binding_id=item.binding_id,
+                        )
+                        candidates_created += 1
+                from . import candidates as cand_mod
+
+                for group_key, topic_plans in session_plans:
+                    alive = [
+                        pair
+                        for pair in dictation_groups[group_key]
+                        if pair[1] in live_fingerprints
+                    ]
+                    if not alive:
+                        continue
+                    for plan in topic_plans:
+                        cand_mod.create_candidate(
+                            tx,
+                            keys.excerpt_key,
+                            candidate_type=plan["candidate_type"],
+                            source_excerpt=plan["source_excerpt"],
+                            normalized_content=plan["content"],
+                            title=plan["title"],
+                            proposed_action=plan["action"],
+                            proposed_parent_ids=plan["parent_ids"],
+                            source_binding_id=group_key[0],
+                            message_hmac=alive[0][1],
+                            batch_date=batch,
                         )
                         candidates_created += 1
                 for entry, owner, placement in planned:
@@ -321,6 +395,62 @@ def _run_daily_locked(state: AppState, client: OpenClawClient) -> dict:
         pending_total,
     )
     return summary
+
+
+def _session_transcript(members) -> tuple[str, str]:
+    """Numbered speaker-labelled transcript plus the owner-only verbatim text."""
+    ordered = sorted(members, key=lambda pair: pair[0].captured_at)
+    lines: list[str] = []
+    owner_parts: list[str] = []
+    for index, (item, _fingerprint) in enumerate(ordered, start=1):
+        label = "助手" if item.speaker == "assistant" else "主人"
+        lines.append(f"[{index}][{label}] {item.body.strip()}")
+        if item.speaker != "assistant":
+            owner_parts.append(item.body.strip())
+    return "\n".join(lines), "\n\n".join(owner_parts)
+
+
+def _session_title(merged: str) -> str:
+    first_line = merged.strip().splitlines()[0] if merged.strip() else "速记"
+    return first_line[:60]
+
+
+def _plan_dictation_session(state: AppState, client: OpenClawClient, members) -> list[dict]:
+    """Compose one dictation session into topic plans (model, with fallback)."""
+    transcript, owner_text = _session_transcript(members)
+    topics: list[dict] = []
+    try:
+        result = client.structured(
+            "dictation_merge", DICTATION_SYSTEM, transcript, DictationMergeResult
+        )
+        topics = [
+            {"title": t.title, "content": t.content, "candidate_type": t.candidate_type}
+            for t in result.topics
+        ]
+    except ModelError:
+        # Explicit capture must never be lost or blocked by a model outage.
+        log.warning("dictation merge model failed; falling back to verbatim session merge")
+    if not topics and owner_text:
+        # Either the model is down or it (illegitimately) dropped the owner's
+        # words: the verbatim session becomes one editable topic.
+        topics = [
+            {
+                "title": _session_title(owner_text),
+                "content": owner_text,
+                "candidate_type": "idea",
+            }
+        ]
+    plans: list[dict] = []
+    for topic in topics:
+        try:
+            with state.reading() as read_conn:
+                action, parent_ids = capture.propose_placement(read_conn, client, topic["content"])
+        except ModelError:
+            action, parent_ids = "create_root", []
+        plans.append(
+            {**topic, "action": action, "parent_ids": parent_ids, "source_excerpt": transcript}
+        )
+    return plans
 
 
 def _owning_item(todo, source_message_no: int, excerpt: str):

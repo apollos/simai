@@ -35,6 +35,17 @@ export interface PluginHookMessageContext {
   senderId?: string;
 }
 
+/** Outbound delivery hook (`message_sent`), fired after a reply is delivered. */
+export interface PluginHookMessageSentEvent {
+  to: string;
+  content: string;
+  success: boolean;
+  messageId?: string;
+  sessionKey?: string;
+  runId?: string;
+  error?: string;
+}
+
 /** `message:preprocessed` is an internal hook, not a typed lifecycle hook. */
 export interface MessagePreprocessedHookEvent {
   type: "message";
@@ -109,6 +120,14 @@ export interface OpenClawPluginApi {
     event: "message_received",
     handler: (
       event: PluginHookMessageReceivedEvent,
+      ctx: PluginHookMessageContext,
+    ) => void | Promise<void>,
+    opts?: { priority?: number; timeoutMs?: number },
+  ): void;
+  on(
+    event: "message_sent",
+    handler: (
+      event: PluginHookMessageSentEvent,
       ctx: PluginHookMessageContext,
     ) => void | Promise<void>,
     opts?: { priority?: number; timeoutMs?: number },

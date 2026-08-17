@@ -82,6 +82,14 @@ models:
     graph_routing: simai
     query: simai
     query_relevance: simai
+    # Web "AI 整理子节点" button. Analysis quality matters more than speed
+    # here; point task_models.reorganize at a strong model when available.
+    reorganize: simai
+    # Dictation session composition (开始记录…记录完毕): merges one session
+    # into topic candidates, splitting only on explicit numbering and weaving
+    # in assistant points the owner endorsed. Falls back to the daily_extract
+    # agent when unset.
+    dictation_merge: simai
   # Sent as x-openclaw-model; body model remains openclaw/simai. The agent's
   # memorySearch must use provider "local" for embeddinggemma-300m. For a
   # remote provider (e.g. SiliconFlow), prefix with the provider so OpenClaw
@@ -92,6 +100,9 @@ models:
   gateway_token_file: null
   # Optional backend model overrides. OpenClaw still owns provider keys and
   # routing; values are sent via x-openclaw-model for the dedicated Agent.
+  # Example: run tree reorganisation on a stronger model than the default:
+  #   task_models:
+  #     reorganize: deepseek/deepseek-v4
   task_models: {}
 
 normalization:

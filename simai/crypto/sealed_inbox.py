@@ -15,6 +15,8 @@ encryption) over a JSON envelope:
       "capture_mode": "passive|explicit",
       "message_id":   "...",        # may be null only when session_key is present
       "session_key":  "...",        # may be null only when message_id is present
+      "dictation_id": "...",        # nullable: groups one dictation session
+      "speaker":      "owner",      # owner | assistant (dictation context)
       "captured_at":  "ISO-8601",
       "body":         "final user text"
     }
@@ -42,6 +44,7 @@ from nacl.public import PrivateKey, PublicKey, SealedBox
 SCHEMA_VERSION = 2
 ITEM_SUFFIX = ".sealed"
 CAPTURE_MODES = frozenset({"passive", "explicit"})
+SPEAKERS = frozenset({"owner", "assistant"})
 
 # These are protocol limits, not merely Web/API validation hints.  They are
 # enforced both before encryption and after decryption so a copied or locally
@@ -58,6 +61,7 @@ MAX_SENDER_KEY_BYTES = 512
 MAX_CONVERSATION_ID_BYTES = 2048
 MAX_MESSAGE_ID_BYTES = 1024
 MAX_SESSION_KEY_BYTES = 2048
+MAX_DICTATION_ID_BYTES = 128
 MAX_CAPTURED_AT_BYTES = 64
 
 ENVELOPE_FIELDS = frozenset(
@@ -72,10 +76,17 @@ ENVELOPE_FIELDS = frozenset(
         "capture_mode",
         "message_id",
         "session_key",
+        "dictation_id",
+        "speaker",
         "captured_at",
         "body",
     }
 )
+
+# dictation_id and speaker were added within schema v2; envelopes sealed by an
+# older plugin build simply omit them and are read with their defaults
+# (dictation_id=None, speaker="owner").
+_OPTIONAL_ENVELOPE_FIELDS = frozenset({"dictation_id", "speaker"})
 
 
 class InboxError(Exception):
@@ -96,6 +107,8 @@ class InboxItem:
     sender_key: str = ""
     conversation_id: str | None = None
     is_group: bool = False
+    dictation_id: str | None = None
+    speaker: str = "owner"
 
     def message_fingerprint(self, hmac_key: bytes) -> str:
         """Stable dedupe key: HMAC(binding_id | message_id-or-fallback)."""
@@ -121,6 +134,8 @@ def seal_item(
     message_id: str | None = None,
     session_key: str | None = None,
     capture_mode: str = "passive",
+    dictation_id: str | None = None,
+    speaker: str = "owner",
     max_body_bytes: int = MAX_BODY_BYTES,
 ) -> Path:
     """Encrypt and atomically persist one user message. Usable while locked."""
@@ -135,6 +150,8 @@ def seal_item(
         message_id=message_id,
         session_key=session_key,
         capture_mode=capture_mode,
+        dictation_id=dictation_id,
+        speaker=speaker,
         max_body_bytes=max_body_bytes,
     )
     ciphertext = SealedBox(public_key).encrypt(plaintext)
@@ -182,6 +199,8 @@ def estimate_sealed_item_size(
     message_id: str | None,
     session_key: str | None,
     capture_mode: str,
+    dictation_id: str | None = None,
+    speaker: str = "owner",
     max_body_bytes: int = MAX_BODY_BYTES,
 ) -> int:
     """Return the exact ciphertext byte count for a prospective item."""
@@ -196,6 +215,8 @@ def estimate_sealed_item_size(
         message_id=message_id,
         session_key=session_key,
         capture_mode=capture_mode,
+        dictation_id=dictation_id,
+        speaker=speaker,
         max_body_bytes=max_body_bytes,
     )
     return len(plaintext) + SEALED_BOX_OVERHEAD_BYTES
@@ -234,7 +255,11 @@ def open_item(path: Path, private_key_bytes: bytes) -> InboxItem:
         raise
     except Exception as exc:
         raise InboxError(f"Cannot decrypt or decode inbox item {path.name}") from exc
-    if type(envelope) is not dict or set(envelope) != ENVELOPE_FIELDS:
+    if (
+        type(envelope) is not dict
+        or set(envelope) - ENVELOPE_FIELDS
+        or not (ENVELOPE_FIELDS - set(envelope)) <= _OPTIONAL_ENVELOPE_FIELDS
+    ):
         raise InboxError(f"Invalid inbox envelope fields in {path.name}")
     if type(envelope["schema_version"]) is not int or envelope["schema_version"] != SCHEMA_VERSION:
         raise InboxError(f"Unsupported inbox schema in {path.name}")
@@ -250,6 +275,8 @@ def open_item(path: Path, private_key_bytes: bytes) -> InboxItem:
             message_id=envelope["message_id"],
             session_key=envelope["session_key"],
             capture_mode=envelope["capture_mode"],
+            dictation_id=envelope.get("dictation_id"),
+            speaker=envelope.get("speaker", "owner"),
         )
         _validate_text(
             envelope["captured_at"],
@@ -274,6 +301,8 @@ def open_item(path: Path, private_key_bytes: bytes) -> InboxItem:
         sender_key=envelope["sender_key"],
         conversation_id=envelope["conversation_id"],
         is_group=envelope["is_group"],
+        dictation_id=envelope.get("dictation_id"),
+        speaker=envelope.get("speaker", "owner"),
     )
 
 
@@ -289,6 +318,8 @@ def validate_item_fields(
     message_id: object,
     session_key: object,
     capture_mode: object,
+    dictation_id: object = None,
+    speaker: object = "owner",
     max_body_bytes: int = MAX_BODY_BYTES,
 ) -> None:
     """Validate the typed v2 fields shared by ingress, seal and open."""
@@ -301,6 +332,9 @@ def validate_item_fields(
     _validate_text(conversation_id, "conversation_id", MAX_CONVERSATION_ID_BYTES, nullable=True)
     _validate_text(message_id, "message_id", MAX_MESSAGE_ID_BYTES, nullable=True)
     _validate_text(session_key, "session_key", MAX_SESSION_KEY_BYTES, nullable=True)
+    _validate_text(dictation_id, "dictation_id", MAX_DICTATION_ID_BYTES, nullable=True)
+    if type(speaker) is not str or speaker not in SPEAKERS:
+        raise InboxError("speaker must be owner or assistant")
     if message_id is None and session_key is None:
         raise InboxError("message_id and session_key cannot both be null")
     if type(is_group) is not bool:
@@ -339,6 +373,8 @@ def _encode_item(
     message_id: object,
     session_key: object,
     capture_mode: object,
+    dictation_id: object,
+    speaker: object,
     max_body_bytes: int,
 ) -> bytes:
     validate_item_fields(
@@ -352,6 +388,8 @@ def _encode_item(
         message_id=message_id,
         session_key=session_key,
         capture_mode=capture_mode,
+        dictation_id=dictation_id,
+        speaker=speaker,
         max_body_bytes=max_body_bytes,
     )
     envelope = {
@@ -359,6 +397,8 @@ def _encode_item(
         "binding_id": binding_id,
         "message_id": message_id,
         "session_key": session_key,
+        "dictation_id": dictation_id,
+        "speaker": speaker,
         "captured_at": datetime.now(UTC).isoformat(timespec="microseconds"),
         "body": body,
         "capture_mode": capture_mode,

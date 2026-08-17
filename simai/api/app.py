@@ -18,7 +18,19 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..config import Config
-from ..core import autorelations, backup, candidates, capture, daily, export, qa, relations, search, tree
+from ..core import (
+    autorelations,
+    backup,
+    candidates,
+    capture,
+    daily,
+    export,
+    qa,
+    relations,
+    reorganize,
+    search,
+    tree,
+)
 from ..core.state import AppState
 from ..crypto import keyring
 from ..db.engine import DatabaseError, DatabaseLocked, now_iso
@@ -85,6 +97,10 @@ class RelationStateBody(BaseModel):
 
 class QueryBody(BaseModel):
     question: str = Field(min_length=1)
+
+
+class ReorganizeBody(BaseModel):
+    node_id: str | None = None  # None reorganises the top level
 
 
 class SearchBody(BaseModel):
@@ -423,6 +439,20 @@ def create_app(config: Config, state: AppState | None = None) -> FastAPI:
         except tree.TreeError as exc:
             raise HTTPException(400, str(exc))
 
+    @app.post("/api/tree/reorganize", dependencies=[Depends(require_session)])
+    def reorganize_children(body: ReorganizeBody):
+        """AI analysis of one node's children: merge suggestions become pending
+        candidates, sibling relations are recorded as ai_generated. Nothing is
+        applied without the user's confirmation."""
+        try:
+            with vault.transaction() as tx:
+                keys = vault.keys
+                return reorganize.reorganize_children(
+                    tx, app.state.llm, keys.audit_hmac_key, keys.excerpt_key, body.node_id
+                )
+        except tree.TreeError as exc:
+            raise HTTPException(404, str(exc))
+
     # -- relations ------------------------------------------------------------------
     @app.get("/api/relations/graph", dependencies=[Depends(require_session)])
     async def relation_graph(node_id: str, depth: int = 1):
@@ -547,7 +577,14 @@ def create_app(config: Config, state: AppState | None = None) -> FastAPI:
     def model_health():
         return {
             task: app.state.llm.health_check(task)
-            for task in ("capture", "daily_extract", "graph_routing", "query", "query_relevance")
+            for task in (
+                "capture",
+                "daily_extract",
+                "graph_routing",
+                "query",
+                "query_relevance",
+                "reorganize",
+            )
         }
 
     # -- personal dictionary (section 8.3) ---------------------------------------

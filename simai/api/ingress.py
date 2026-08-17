@@ -6,7 +6,7 @@ per line:
     {"binding_id": "...", "channel": "...", "account_id": "...",
      "sender_key": "...", "conversation_id": "...", "is_group": false,
      "capture_mode": "passive", "message_id": "...",
-     "session_key": "...", "body": "..."}
+     "session_key": "...", "dictation_id": null, "body": "..."}
 
 The service validates that the binding exists and is enabled in config
 (the plugin has already performed channel/account/sender whitelisting),
@@ -31,6 +31,7 @@ from ..crypto import keyring, sealed_inbox
 log = logging.getLogger("simai.ingress")
 
 INGRESS_FIELDS = sealed_inbox.ENVELOPE_FIELDS - {"schema_version", "captured_at"}
+_OPTIONAL_INGRESS_FIELDS = frozenset({"dictation_id", "speaker"})
 
 
 class IngressServer:
@@ -99,8 +100,14 @@ class IngressServer:
                     break
                 try:
                     payload = json.loads(line.decode("utf-8"), object_pairs_hook=_unique_object)
-                    if type(payload) is not dict or set(payload) != INGRESS_FIELDS:
+                    if type(payload) is not dict:
+                        raise ValueError("unexpected ingress payload")
+                    fields = set(payload)
+                    # Older plugin builds omit the optional dictation fields.
+                    if fields - INGRESS_FIELDS or not (INGRESS_FIELDS - fields) <= _OPTIONAL_INGRESS_FIELDS:
                         raise ValueError("unexpected ingress fields")
+                    payload.setdefault("dictation_id", None)
+                    payload.setdefault("speaker", "owner")
                     binding_id = payload["binding_id"]
                     body = payload["body"]
                     capture_mode = payload["capture_mode"]
@@ -115,6 +122,8 @@ class IngressServer:
                         message_id=payload["message_id"],
                         session_key=payload["session_key"],
                         capture_mode=capture_mode,
+                        dictation_id=payload["dictation_id"],
+                        speaker=payload["speaker"],
                         max_body_bytes=max_bytes,
                     )
                 except (UnicodeDecodeError, ValueError, sealed_inbox.InboxError):
@@ -150,6 +159,8 @@ class IngressServer:
                     message_id=payload["message_id"],
                     session_key=payload["session_key"],
                     capture_mode=capture_mode,
+                    dictation_id=payload["dictation_id"],
+                    speaker=payload["speaker"],
                     max_body_bytes=max_bytes,
                 )
                 async with self._queue_lock:
@@ -188,6 +199,8 @@ class IngressServer:
                         message_id=payload["message_id"],
                         session_key=payload["session_key"],
                         capture_mode=capture_mode,
+                        dictation_id=payload["dictation_id"],
+                        speaker=payload["speaker"],
                         max_body_bytes=max_bytes,
                     )
                 writer.write(b'{"ok": true}\n')

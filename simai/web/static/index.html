@@ -192,6 +192,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
         <h2 style="margin:0">思维树</h2>
         <div class="row">
           <button class="small" onclick="promptNewRoot()">新建一级主题</button>
+          <button class="ghost small" onclick="reorganizeNode(null)" title="用整理模型分析一级主题，生成合并建议与关系提案（需确认后生效）">AI 整理一级主题</button>
           <button class="ghost small" onclick="loadTree()">刷新</button>
         </div>
       </div>
@@ -420,7 +421,7 @@ async function loadInbox() {
       `<option value="${n.id}">${esc(n.title)} (${esc(n.id)})</option>`).join("");
     $("#pendingBadge").textContent = d.candidates.length;
     if (!d.candidates.length) { $("#inboxList").innerHTML = '<p class="muted">没有待确认的候选。</p>'; return; }
-    $("#inboxList").innerHTML = d.candidates.map(c => `
+    $("#inboxList").innerHTML = d.candidates.map(c => c.proposed_action === "merge" ? renderMergeCard(c) : `
       <div class="card" id="cand-${c.candidate_id}">
         <div class="row" style="justify-content:space-between">
           <span><input type="checkbox" class="candidate-select" value="${c.candidate_id}" style="width:auto">
@@ -459,6 +460,47 @@ async function loadInbox() {
         </div>
       </div>`).join("");
   } catch (e) { /* locked or session expired: handled globally */ }
+}
+function renderMergeCard(c) {
+  // AI reorganize proposal: append source node's content into target node.
+  // No checkbox on purpose - merge cards are excluded from batch actions.
+  const src = c.proposed_parents[0], dst = c.proposed_parents[1];
+  const valid = src && dst;
+  return `
+    <div class="card" id="cand-${c.candidate_id}">
+      <div class="row" style="justify-content:space-between">
+        <b>${esc(c.title)}</b>
+        <span><span class="badge">AI 整理</span> <span class="badge warn">merge</span></span>
+      </div>
+      ${valid ? `<div class="muted" style="margin:6px 0">${esc(src.path)} <b>→ 并入 →</b> ${esc(dst.path)}</div>` : ""}
+      ${c.source_excerpt ? `<div class="excerpt">${esc(c.source_excerpt)}</div>` : ""}
+      <div class="actions">
+        ${valid
+          ? `<button class="small" onclick="confirmMergeCand('${c.candidate_id}','${src.node_id}','${dst.node_id}')">确认合并</button>`
+          : '<span class="muted">合并端点已不存在，只能拒绝</span>'}
+        <button class="small ghost" onclick="snoozeCand('${c.candidate_id}')">暂缓</button>
+        <button class="small danger" onclick="rejectCand('${c.candidate_id}')">拒绝</button>
+      </div>
+    </div>`;
+}
+async function confirmMergeCand(id, sourceId, targetId) {
+  try {
+    await api(`/api/candidates/${id}/confirm`, {
+      method: "POST", body: { action: "merge", target_node_id: sourceId, parent_id: targetId }
+    });
+    toast("已合并：源节点内容并入目标节点（源节点保留为 merged 状态，历史可追溯）");
+    loadInbox(); loadTree();
+  } catch (e) { toast("合并失败：" + e.message, 6000); }
+}
+async function reorganizeNode(id) {
+  try {
+    toast("正在用整理模型分析子节点，请稍候…", 8000);
+    const d = await api("/api/tree/reorganize", { method: "POST", body: { node_id: id } });
+    if (d.skipped) { toast("未整理：" + d.skipped, 6000); return; }
+    toast(`整理完成：${d.merge_candidates} 条合并建议已进入待确认箱，${d.relation_proposals} 条 AI 关系待确认`, 8000);
+    loadInbox();
+    if (id) openNode(id); else loadTree();
+  } catch (e) { toast("整理失败：" + e.message, 8000); }
 }
 function candidateDecisionBody(id) {
   const parent = $(`#parent-${id}`).value || null;
@@ -572,6 +614,7 @@ async function openNode(id) {
       <button class="small ghost" onclick="saveNode('append')">追加为补充版本</button>
       <button class="small ghost" onclick="moveNodePrompt('${id}')">移动</button>
       <button class="small ghost" onclick="loadGraphFor('${id}')">查看关系图</button>
+      ${d.children.length >= 2 ? `<button class="small ghost" onclick="reorganizeNode('${id}')" title="用整理模型分析该节点的子节点，生成合并建议与关系提案（需确认后生效）">AI 整理子节点（${d.children.length}）</button>` : ""}
       <button class="small danger" onclick="archiveNode('${id}')">归档</button>
     </div>
     <h2 style="margin-top:18px">语义关系</h2>
@@ -793,7 +836,8 @@ function guard(fn) {
 ["doInit", "doUnlock", "doLock", "doCapture", "confirmCand", "rejectCand", "snoozeCand",
  "batchCandidates", "promptNewRoot", "loadTree", "saveNode", "moveNodePrompt", "archiveNode",
  "restoreRev", "setRel", "loadGraph", "doSearch", "doQuery", "runDaily", "checkModels",
- "doBackup", "doExport", "addDictionaryTerm", "removeDictionaryTerm"
+ "doBackup", "doExport", "addDictionaryTerm", "removeDictionaryTerm",
+ "confirmMergeCand", "reorganizeNode"
 ].forEach(n => { window[n] = guard(window[n]); });
 
 boot();

@@ -42,8 +42,13 @@ export interface InboxSubmission {
   conversation_id: string | null;
   is_group: boolean;
   capture_mode: CaptureMode;
-  message_id: string;
+  /** Nullable only when session_key is present (mirrors the core schema). */
+  message_id: string | null;
   session_key: string | null;
+  /** Groups every message of one dictation session (开始记录…记录完毕). */
+  dictation_id?: string | null;
+  /** Who spoke: the owner (default) or the assistant (dictation context). */
+  speaker?: "owner" | "assistant";
   body: string;
 }
 
@@ -166,8 +171,10 @@ export async function sealDirectToInbox(
       sender_key: item.sender_key,
       conversation_id: item.conversation_id,
       is_group: item.is_group,
-      message_id: item.message_id,
-      session_key: item.session_key,
+      message_id: item.message_id || null,
+      session_key: item.session_key || null,
+      dictation_id: item.dictation_id ?? null,
+      speaker: item.speaker ?? "owner",
       captured_at: capturedAt,
       body: item.body,
       capture_mode: item.capture_mode,
@@ -259,20 +266,34 @@ function inspectSealedQueue(inboxDir: string): { items: number; bytes: number } 
 }
 
 function validateSubmission(item: InboxSubmission): void {
-  const required = [
-    item.binding_id,
-    item.channel,
-    item.account_id,
-    item.sender_key,
-    item.message_id,
-    item.body,
-  ];
+  const required = [item.binding_id, item.channel, item.account_id, item.sender_key, item.body];
   if (required.some((value) => typeof value !== "string" || value.length === 0)) {
     throw new Error("invalid inbox submission");
+  }
+  const hasMessageId = typeof item.message_id === "string" && item.message_id.length > 0;
+  const hasSessionKey = typeof item.session_key === "string" && item.session_key.length > 0;
+  if (!hasMessageId && !hasSessionKey) {
+    throw new Error("message_id and session_key cannot both be empty");
+  }
+  if (item.message_id !== null && typeof item.message_id !== "string") {
+    throw new Error("invalid message id");
   }
   if (typeof item.is_group !== "boolean") throw new Error("invalid group flag");
   if (item.capture_mode !== "passive" && item.capture_mode !== "explicit") {
     throw new Error("invalid capture mode");
+  }
+  const dictationId = item.dictation_id ?? null;
+  if (
+    dictationId !== null &&
+    (typeof dictationId !== "string" ||
+      dictationId.length === 0 ||
+      Buffer.byteLength(dictationId, "utf-8") > 128)
+  ) {
+    throw new Error("invalid dictation id");
+  }
+  const speaker = item.speaker ?? "owner";
+  if (speaker !== "owner" && speaker !== "assistant") {
+    throw new Error("invalid speaker");
   }
 }
 

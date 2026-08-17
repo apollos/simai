@@ -139,11 +139,21 @@ grep -a "simai plugin registered" /tmp/openclaw/openclaw-$(date +%F).log | tail 
 > 「开始记录」「我有想法请记录」；关闭：「不开车了」「结束速记模式」「记录完毕」
 > 「停止记录」。期间所有消息按 explicit 逐字入箱，不经过日批的保守聊天过滤。
 > 另外 `/` 开头的宿主命令（如 `/reset`）在任何模式下都不会入箱。
+> 同一次速记会话（开启→关闭之间）共享一个 `dictation_id`，Bot 在期间的回复也
+> 以 `speaker=assistant` 同会话入箱（仅作上下文）。日批用 `dictation_merge`
+> 模型整理整个会话：默认**合并成一条主题候选**；只有当输入带明确编号
+> （1. 2. / 第一、第二）且内容确实不相关时才拆成多条；Bot 回复中只有被你
+> 明确肯定或评论过的要点才并入主题（标注「采纳自助手回复」）。模型故障时
+> 回退为你的原话逐字合并，显式记录永不丢失。
 
 1. 微信发「记录一下：<一句想法>」→ Bot 应回确认卡（`simai_capture` 工具）。
-2. 微信依次发：「我在开车，接下来只记录」→ 再发三条任意想法 → 「不开车了」。
-3. 解锁 Web（SSH tunnel → `http://127.0.0.1:18880`），待确认箱应出现三条
-   `explicit` 候选，逐条确认/拒绝。
+2. 微信依次发：「我在开车，接下来只记录」→ 再发三条围绕同一主题的想法
+   →（若 Bot 有回复，可对其中一条回「对，就按这个」）→ 「不开车了」。
+3. 解锁 Web（SSH tunnel → `http://127.0.0.1:18880`），运行日批后待确认箱应出现
+   **一条**合并候选（三条想法按说出顺序整合；若第 2 步做了肯定回复，候选正文
+   还应包含「采纳自助手回复：…」），确认/拒绝即可。
+4. 可选拆分验证：再开一次速记，发「1. <想法A>」「2. <一件不相关的事>」后关闭；
+   日批应产出**两条**独立候选。
 
 ## 第 7 步：锁定态密文验证（门槛 6）
 
@@ -233,3 +243,23 @@ Prompt 或模型输出（Simai 默认关闭 access log，模型调用日志只�
 - [ ] 10. 全部日志无敏感内容
 
 全部勾选后，微信被动采集即为正式启用状态。
+
+---
+
+## 附：本轮功能更新的云端升级步骤
+
+1. 速记会话合并：`git pull` 后**必须同时**更新插件与核心——
+   `cd plugin && npm ci && npm run build && openclaw plugins install --force ~/workspace/simai/plugin`，
+   修正安装目录权限（`find ~/.openclaw/extensions/simai -type d -exec chmod 755 {} +; find ~/.openclaw/extensions/simai -type f -exec chmod 644 {} +`），
+   重启 Gateway；再重启 `simai serve`。旧插件写入的密文仍可正常解密（按无会话处理）。
+   合并质量取决于 `dictation_merge` 模型任务（默认复用 `daily_extract` 的
+   Agent）；要用更强的模型，在 `~/.simai/simai.yaml` 的 `models` 下加
+   `task_agents.dictation_merge: simai` 与 `task_models.dictation_merge: <强模型标识>`。
+   验证助手回复入箱：速记期间 Bot 回复后，
+   `grep -ao 'simai[^"\\]*assistant reply sealed[^"\\]*' /tmp/openclaw/openclaw-$(date +%F).log | tail -2`。
+2. Web「AI 整理子节点」：节点详情页与思维树页新增按钮，分析结果只产生
+   **待确认**的合并建议（待确认箱）与 `ai_generated` 关系（节点详情页确认/否决）。
+   整理任务默认复用 `daily_extract` 的 Agent；要用更强的模型，在
+   `~/.simai/simai.yaml` 的 `models` 下加：
+   `task_agents.reorganize: simai` 与 `task_models.reorganize: <强模型标识>`
+   （经 `x-openclaw-model` 转发，无需在 Simai 存任何 API key）。

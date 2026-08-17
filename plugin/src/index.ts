@@ -6,6 +6,7 @@ import {
   normalizeSenderKey,
   ownerFallbackBinding,
 } from "./identity.js";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { submitWithEncryptedFallback, type InboxSubmission } from "./inbox.js";
@@ -51,8 +52,13 @@ export default plugin;
  */
 let sharedCorrelations: { windowMs: number; store: CorrelationStore } | undefined;
 const sharedVerifiedSessions = new Map<string, VerifiedIdentity>();
-const sharedDrivingMode = new Set<string>();
+// bindingId -> dictation session id: every message captured while the mode is
+// on carries this id so the core can merge the session into ONE topic.
+const sharedDrivingMode = new Map<string, string>();
 const sharedRecentlyCaptured = new Map<string, number>();
+
+const newDictationId = (): string =>
+  `${Date.now().toString(36)}-${randomBytes(6).toString("hex")}`;
 
 /** Test isolation only. */
 export function resetSimaiSharedState(): void {
@@ -193,6 +199,7 @@ function registerSimai(api: OpenClawPluginApi): void {
     identity: VerifiedIdentity,
     body: string,
     captureMode: CaptureMode,
+    dictationId: string | null = null,
   ): InboxSubmission => ({
     binding_id: identity.bindingId,
     channel: identity.channel,
@@ -203,6 +210,7 @@ function registerSimai(api: OpenClawPluginApi): void {
     capture_mode: captureMode,
     message_id: identity.messageId,
     session_key: identity.sessionKey,
+    dictation_id: dictationId,
     body,
   });
 
@@ -217,6 +225,12 @@ function registerSimai(api: OpenClawPluginApi): void {
     const key = `${matched.bindingId}\u0000${matched.messageId}`;
     if (recentlyCaptured.has(key)) return true;
     recentlyCaptured.set(key, now);
+    return false;
+  };
+  const alreadySealedAssistant = (bindingId: string, messageId: string): boolean => {
+    const key = `assistant\u0000${bindingId}\u0000${messageId}`;
+    if (recentlyCaptured.has(key)) return true;
+    recentlyCaptured.set(key, Date.now());
     return false;
   };
 
@@ -237,8 +251,11 @@ function registerSimai(api: OpenClawPluginApi): void {
     }
 
     if (DRIVING_ON.test(body)) {
-      drivingMode.add(matched.bindingId);
-      api.logger.info(`simai: driving mode enabled binding=${matched.bindingId}`);
+      const dictationId = newDictationId();
+      drivingMode.set(matched.bindingId, dictationId);
+      api.logger.info(
+        `simai: driving mode enabled binding=${matched.bindingId} session=${dictationId}`,
+      );
       return;
     }
     if (DRIVING_OFF.test(body)) {
@@ -247,8 +264,11 @@ function registerSimai(api: OpenClawPluginApi): void {
       return;
     }
 
-    if (drivingMode.has(matched.bindingId)) {
-      const ok = await submitEncrypted(inboxItem(matched, matched.body, "explicit"));
+    const dictationId = drivingMode.get(matched.bindingId);
+    if (dictationId) {
+      const ok = await submitEncrypted(
+        inboxItem(matched, matched.body, "explicit", dictationId),
+      );
       if (!ok) {
         api.logger.warn(
           `simai: driving-mode sealed inbox submission failed binding=${matched.bindingId}`,
@@ -386,6 +406,86 @@ function registerSimai(api: OpenClawPluginApi): void {
         description: "Capture only the final ASR/media-aware user body after exact identity correlation.",
       },
     );
+
+    // Dictation context: while a binding is in dictation mode, the assistant's
+    // delivered replies are sealed too (speaker=assistant, same dictation_id).
+    // The daily merge only keeps assistant points the owner explicitly
+    // endorsed, but without this context an owner's "对，就按这个" would lose
+    // its referent entirely.
+    try {
+      api.on("message_sent", async (event, ctx) => {
+        if (probeMode) {
+          probeLog("message_sent", {
+            channelId: ctx.channelId ?? null,
+            accountId: ctx.accountId ?? null,
+            to: event.to ?? null,
+            conversationId: ctx.conversationId ?? null,
+            messageId: event.messageId ?? ctx.messageId ?? null,
+            hasSessionKey: Boolean(event.sessionKey ?? ctx.sessionKey),
+            success: event.success,
+            contentLength: event.content?.length ?? 0,
+          });
+          return;
+        }
+        if (drivingMode.size === 0) return;
+        if (event.success === false) return;
+        const body = event.content?.trim();
+        if (!body) return;
+        const target = event.to ?? ctx.conversationId;
+        const matches = enabledBindings.filter((binding) => {
+          if (!drivingMode.has(binding.id)) return false;
+          if (ctx.channelId && binding.channel !== ctx.channelId) return false;
+          if (ctx.accountId && binding.accountId !== ctx.accountId) return false;
+          if (
+            binding.conversationId !== undefined &&
+            target !== undefined &&
+            target !== binding.conversationId
+          ) {
+            return false;
+          }
+          return true;
+        });
+        // Ambiguity fails closed: an outbound reply must map to exactly one
+        // dictating binding or it is not captured at all.
+        if (matches.length !== 1) return;
+        const binding = matches[0];
+        const dictationId = drivingMode.get(binding.id);
+        if (!dictationId) return;
+        const messageId = event.messageId ?? ctx.messageId ?? null;
+        const sessionKey = event.sessionKey ?? ctx.sessionKey ?? null;
+        if (!messageId && !sessionKey) return;
+        if (messageId && alreadySealedAssistant(binding.id, messageId)) return;
+        const ok = await submitEncrypted({
+          binding_id: binding.id,
+          channel: binding.channel,
+          account_id: binding.accountId,
+          sender_key: binding.senderKey,
+          conversation_id: binding.conversationId ?? null,
+          is_group: false,
+          capture_mode: "explicit",
+          message_id: messageId,
+          session_key: sessionKey,
+          dictation_id: dictationId,
+          speaker: "assistant",
+          body,
+        });
+        if (!ok) {
+          api.logger.warn(
+            `simai: assistant reply sealing failed binding=${binding.id}`,
+          );
+        } else {
+          api.logger.info(
+            `simai: assistant reply sealed binding=${binding.id} ` +
+              `messageId=${messageId ?? "<none>"} session=${dictationId}`,
+          );
+        }
+      });
+    } catch {
+      api.logger.warn(
+        "simai: host does not support the message_sent hook; assistant replies " +
+          "will not be captured during dictation",
+      );
+    }
   }
 
   if (api.registrationMode === "full" || api.registrationMode === "tool-discovery") {
@@ -403,12 +503,13 @@ function registerTools(
   api: OpenClawPluginApi,
   getCore: () => SimaiCoreClient,
   authorize: (ctx: OpenClawPluginToolContext) => VerifiedIdentity | null,
-  drivingMode: Set<string>,
+  drivingMode: Map<string, string>,
   submitEncrypted: (item: InboxSubmission) => Promise<boolean>,
   inboxItem: (
     identity: VerifiedIdentity,
     body: string,
     captureMode: CaptureMode,
+    dictationId?: string | null,
   ) => InboxSubmission,
 ): void {
   const deny = { error: "simai: source not whitelisted or message identity not correlated" };
@@ -454,8 +555,9 @@ function registerTools(
     ),
     async (args, identity) => {
       const text = requiredString(args, "text");
-      if (drivingMode.has(identity.bindingId)) {
-        const ok = await submitEncrypted(inboxItem(identity, text, "explicit"));
+      const dictationId = drivingMode.get(identity.bindingId);
+      if (dictationId) {
+        const ok = await submitEncrypted(inboxItem(identity, text, "explicit", dictationId));
         return ok ? { status: "已进入加密待确认箱" } : { error: "暂存失败，请稍后再试" };
       }
 

@@ -64,6 +64,11 @@ class OpenClawClient:
         agent = self.task_agents.get(task)
         if not agent and task == "query_relevance":
             agent = self.task_agents.get("query")
+        if not agent and task in ("reorganize", "dictation_merge"):
+            # These tasks benefit from a strong model; configure
+            # models.task_agents.<task> (+ task_models.<task>) for that.
+            # Until then, reuse the daily-extract agent.
+            agent = self.task_agents.get("daily_extract") or self.task_agents.get("capture")
         if not agent:
             raise ModelError(f"No agent configured for task '{task}' (models.task_agents)")
         return f"openclaw/{agent}"

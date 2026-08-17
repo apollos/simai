@@ -24,15 +24,21 @@ from simai.core.daily import run_daily
 from simai.core.state import AppState
 from simai.crypto import keyring, sealed_inbox
 from simai.db.engine import verify_capabilities
+from simai.llm.client import ModelError
 from simai.llm.schemas import (
     CaptureBatchResult,
     CaptureResult,
+    ChildMergeProposal,
+    ChildRelationProposal,
     DailyExtractItem,
     DailyExtractResult,
+    DictationMergeResult,
+    DictationTopic,
     PlacementResult,
     QueryAnswer,
     QueryCitation,
     QueryRelevance,
+    ReorganizeResult,
 )
 
 PASS = "correct horse battery staple"
@@ -90,6 +96,58 @@ class FakeLLM:
             return QueryAnswer(
                 answer="测试回答",
                 citations=[QueryCitation(node_id=ids[0], revision_no=999, path="错误 / 路径")] if ids else [],
+            )
+        if schema is ReorganizeResult:
+            ids = re.findall(r"NODE (N-\d{8}-[0-9a-f]+)", user)
+            merges = []
+            rels = []
+            if len(ids) >= 2:
+                merges.append(
+                    ChildMergeProposal(
+                        source_node_id=ids[0],
+                        target_node_id=ids[1],
+                        rationale="两个子节点表达的是同一个观点",
+                        confidence=0.9,
+                    )
+                )
+            if len(ids) >= 3:
+                rels.append(
+                    ChildRelationProposal(
+                        from_node_id=ids[0],
+                        to_node_id=ids[2],
+                        relation_type="related_to",
+                        rationale="主题相关",
+                        confidence=0.8,
+                    )
+                )
+            return ReorganizeResult(merges=merges, relations=rels)
+        if schema is DictationMergeResult:
+            # Deterministic mimic of the dictation-merge contract: numbered
+            # owner items split into topics; otherwise ONE topic of the owner's
+            # words plus any assistant point the owner endorsed ("对…").
+            entries = []
+            for line in user.splitlines():
+                match = re.match(r"^\[\d+\]\[(主人|助手)\]\s*(.*)$", line)
+                if match:
+                    entries.append((match.group(1), match.group(2)))
+            numbered = [b for s, b in entries if s == "主人" and re.match(r"^\d+[\.、．]", b)]
+            if len(numbered) >= 2:
+                return DictationMergeResult(
+                    topics=[DictationTopic(title=b[:30], content=b) for b in numbered]
+                )
+            owner = [b for s, b in entries if s == "主人"]
+            adopted = [
+                f"（采纳自助手回复：{entries[i - 1][1]}）"
+                for i, (s, b) in enumerate(entries)
+                if s == "主人" and b.startswith("对") and i > 0 and entries[i - 1][0] == "助手"
+            ]
+            return DictationMergeResult(
+                topics=[
+                    DictationTopic(
+                        title=(owner[0][:30] if owner else "速记"),
+                        content="\n\n".join(owner + adopted),
+                    )
+                ]
             )
         if schema is DailyExtractResult:
             items = []
@@ -747,6 +805,201 @@ def run(workdir: Path) -> None:
         race_summary["candidates"] == 0
         and race_summary["skipped_already_handled"] >= 1
         and race_after == race_before + 1,
+    )
+
+    print("dictation session merge")
+    config.raw["daily_capture"]["max_messages_per_run"] = 10
+
+    def seal_dictation(
+        body: str, message_id: str, dictation_id: str | None, speaker: str = "owner"
+    ):
+        return sealed_inbox.seal_item(
+            config.inbox_dir,
+            pub,
+            "local_cli",
+            body,
+            channel="cli",
+            account_id="local",
+            sender_key="owner",
+            conversation_id=None,
+            is_group=False,
+            message_id=message_id,
+            capture_mode="explicit",
+            dictation_id=dictation_id,
+            speaker=speaker,
+        )
+
+    seal_dictation("产品加密应默认开启", "dict-1", "session-a")
+    seal_dictation("而且密钥要支持定期轮换", "dict-2", "session-a")
+    seal_dictation("独立的一条显式记录", "dict-3", None)
+    dictation_summary = run_daily(state, FakeLLM())
+    ok(
+        "dictation session merges into one candidate plus one raw",
+        dictation_summary["processed"] == 3 and dictation_summary["candidates"] == 2,
+    )
+    merged_row = state.conn.execute(
+        """SELECT normalized_content, title, proposed_action FROM candidates
+           WHERE normalized_content LIKE '%产品加密应默认开启%' AND status = 'pending'"""
+    ).fetchone()
+    ok(
+        "merged session keeps both utterances in spoken order",
+        merged_row is not None
+        and "产品加密应默认开启\n\n而且密钥要支持定期轮换" == merged_row["normalized_content"]
+        and merged_row["title"] == "产品加密应默认开启",
+    )
+    single_row = state.conn.execute(
+        "SELECT id FROM candidates WHERE normalized_content = '独立的一条显式记录' AND status = 'pending'"
+    ).fetchone()
+    ok("explicit item outside a session stays a separate candidate", single_row is not None)
+
+    # Endorsed assistant content is woven into the topic; explicit numbering of
+    # unrelated items splits the session into separate topics.
+    seal_dictation("语音接口应该做成流式", "dict-4", "session-b")
+    seal_dictation("建议同时支持增量转写和断点续传", "dict-5", "session-b", speaker="assistant")
+    seal_dictation("对，就按这个方案来", "dict-6", "session-b")
+    seal_dictation("1. 加密默认开启的推进计划", "dict-7", "session-c")
+    seal_dictation("2. 周末给家里换个路由器", "dict-8", "session-c")
+    rich_summary = run_daily(state, FakeLLM())
+    ok(
+        "dictation model composes one merged topic plus two numbered topics",
+        rich_summary["processed"] == 5 and rich_summary["candidates"] == 3,
+    )
+    endorsed_row = state.conn.execute(
+        """SELECT normalized_content FROM candidates
+           WHERE normalized_content LIKE '%语音接口应该做成流式%' AND status = 'pending'"""
+    ).fetchone()
+    ok(
+        "owner-endorsed assistant point is woven into the merged topic",
+        endorsed_row is not None
+        and "对，就按这个方案来" in endorsed_row["normalized_content"]
+        and "采纳自助手回复：建议同时支持增量转写和断点续传" in endorsed_row["normalized_content"],
+    )
+    numbered_count = state.conn.execute(
+        """SELECT COUNT(*) FROM candidates WHERE status = 'pending'
+           AND (normalized_content LIKE '1.%' OR normalized_content LIKE '2.%')"""
+    ).fetchone()[0]
+    ok("explicitly numbered unrelated items become separate topics", numbered_count == 2)
+
+    # A dictation-merge model outage must never lose or block explicit capture:
+    # the owner's verbatim words fall back to one topic; assistant context is
+    # dropped because nobody can decide what was endorsed.
+    class DictationModelDown(FakeLLM):
+        def structured(self, task, system, user, schema):
+            if schema is DictationMergeResult:
+                raise ModelError("dictation model down")
+            return super().structured(task, system, user, schema)
+
+    seal_dictation("模型故障时也不能丢的想法", "dict-9", "session-d")
+    seal_dictation("这是助手的插话", "dict-10", "session-d", speaker="assistant")
+    down_summary = run_daily(state, DictationModelDown())
+    fallback_row = state.conn.execute(
+        """SELECT normalized_content FROM candidates
+           WHERE normalized_content LIKE '%模型故障时也不能丢的想法%' AND status = 'pending'"""
+    ).fetchone()
+    ok(
+        "dictation model outage falls back to verbatim owner-only merge",
+        down_summary["candidates"] == 1
+        and fallback_row is not None
+        and "助手的插话" not in fallback_row["normalized_content"],
+    )
+    config.raw["daily_capture"]["max_messages_per_run"] = 1
+
+    print("legacy envelope without dictation_id still opens")
+    from datetime import UTC, datetime
+
+    from nacl.public import SealedBox
+
+    legacy_envelope = {
+        "schema_version": 2,
+        "binding_id": "local_cli",
+        "message_id": "legacy-1",
+        "session_key": None,
+        "captured_at": datetime.now(UTC).isoformat(timespec="microseconds"),
+        "body": "旧插件写入的密文",
+        "capture_mode": "passive",
+        "channel": "cli",
+        "account_id": "local",
+        "sender_key": "owner",
+        "conversation_id": None,
+        "is_group": False,
+    }
+    legacy_path = config.inbox_dir / "00000000000000000001-legacy.sealed"
+    legacy_path.write_bytes(
+        SealedBox(pub).encrypt(json.dumps(legacy_envelope, ensure_ascii=False).encode("utf-8"))
+    )
+    legacy_path.chmod(0o600)
+    legacy_item = sealed_inbox.open_item(legacy_path, keys.inbox_private_key)
+    ok(
+        "pre-dictation envelopes decode with dictation_id=None and speaker=owner",
+        legacy_item.dictation_id is None
+        and legacy_item.speaker == "owner"
+        and legacy_item.body == "旧插件写入的密文",
+    )
+    sealed_inbox.delete_item(legacy_path)
+
+    print("reorganize children")
+    from simai.core import reorganize as reorganize_mod
+
+    with state.transaction() as tx:
+        reorg_parent = tree.create_node(tx, keys.audit_hmac_key, "整理演练主题", "", "topic", None)
+        tree.create_node(
+            tx, keys.audit_hmac_key, "加密默认开启", "产品加密应当默认开启", "opinion",
+            reorg_parent["node_id"],
+        )
+        tree.create_node(
+            tx, keys.audit_hmac_key, "默认加密立场", "加密必须是产品的默认设置", "opinion",
+            reorg_parent["node_id"],
+        )
+        tree.create_node(
+            tx, keys.audit_hmac_key, "密钥轮换", "密钥应当支持定期轮换", "idea",
+            reorg_parent["node_id"],
+        )
+    with state.transaction() as tx:
+        reorg_summary = reorganize_mod.reorganize_children(
+            tx, FakeLLM(), keys.audit_hmac_key, keys.excerpt_key, reorg_parent["node_id"]
+        )
+    ok(
+        "reorganize records proposals only",
+        reorg_summary["children"] == 3
+        and reorg_summary["merge_candidates"] == 1
+        and reorg_summary["relation_proposals"] == 1,
+    )
+    merge_cand = state.conn.execute(
+        "SELECT * FROM candidates WHERE proposed_action = 'merge' AND status = 'pending'"
+    ).fetchone()
+    merge_endpoints = json.loads(merge_cand["proposed_parent_ids"])
+    ok(
+        "merge proposal does not touch the tree before confirmation",
+        len(merge_endpoints) == 2
+        and all(
+            state.conn.execute("SELECT state FROM nodes WHERE id = ?", (nid,)).fetchone()["state"]
+            == "active"
+            for nid in merge_endpoints
+        ),
+    )
+    reorg_rel = state.conn.execute(
+        "SELECT state, origin FROM relations WHERE model_profile = 'reorganize'"
+    ).fetchone()
+    ok(
+        "reorganize relation lands as ai_generated for review",
+        reorg_rel["state"] == "ai_generated" and reorg_rel["origin"] == "ai",
+    )
+    with state.transaction() as tx:
+        candidates.confirm_candidate(
+            tx,
+            keys.audit_hmac_key,
+            merge_cand["id"],
+            action="merge",
+            target_node_id=merge_endpoints[0],
+            parent_id=merge_endpoints[1],
+        )
+    merged_source_state = state.conn.execute(
+        "SELECT state FROM nodes WHERE id = ?", (merge_endpoints[0],)
+    ).fetchone()["state"]
+    merged_target_body = tree.get_current_revision(state.conn, merge_endpoints[1])["body"]
+    ok(
+        "confirmed merge appends source into target and retires the source",
+        merged_source_state == "merged" and "产品加密应当默认开启" in merged_target_body,
     )
 
     print("export")

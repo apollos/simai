@@ -117,6 +117,66 @@ class RelationProposals(BaseModel):
     relations: list[RelationProposal] = Field(default_factory=list, max_length=5)
 
 
+class DictationTopic(BaseModel):
+    """One coherent topic composed from a dictation session."""
+
+    title: str = Field(max_length=120)
+    content: str = Field(min_length=1)
+    candidate_type: str = "idea"
+
+    @field_validator("candidate_type")
+    @classmethod
+    def _type_ok(cls, v: str) -> str:
+        if v not in CANDIDATE_TYPES:
+            raise ValueError(f"invalid candidate_type {v}")
+        return v
+
+
+class DictationMergeResult(BaseModel):
+    """Output of the dictation_merge task.
+
+    Default is ONE topic per session; multiple topics only when the owner
+    explicitly enumerated independent items. An empty list is legal (e.g. a
+    session holding assistant context only); the daily worker falls back to
+    the owner's verbatim words whenever those would otherwise be lost.
+    """
+
+    topics: list[DictationTopic] = Field(default_factory=list, max_length=5)
+
+
+class ChildMergeProposal(BaseModel):
+    """Reorganize: append source child's content into target child (user-confirmed)."""
+
+    source_node_id: str
+    target_node_id: str
+    rationale: str = Field(max_length=300)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class ChildRelationProposal(BaseModel):
+    """Reorganize: semantic relation between two children of the same parent."""
+
+    from_node_id: str
+    to_node_id: str
+    relation_type: str
+    rationale: str = Field(max_length=300)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("relation_type")
+    @classmethod
+    def _rel_ok(cls, v: str) -> str:
+        if v not in RELATION_TYPES:
+            raise ValueError(f"invalid relation_type {v}")
+        return v
+
+
+class ReorganizeResult(BaseModel):
+    """Output of the tree-reorganize task: proposals only, never actions."""
+
+    merges: list[ChildMergeProposal] = Field(default_factory=list, max_length=5)
+    relations: list[ChildRelationProposal] = Field(default_factory=list, max_length=8)
+
+
 class QueryRelevance(BaseModel):
     """Precision filter after recall: only nodes that actually answer the question."""
 
