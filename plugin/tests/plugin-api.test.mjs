@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import test from "node:test";
 import sodium from "libsodium-wrappers";
@@ -386,6 +387,90 @@ test("2026.7.1 hooks correlate exact identity and tools use factory/execute", as
     received = readEnvelopes(root, keypair);
     assert.equal(received.some((entry) => entry.body === "会话结束后的回复"), false);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("结束记录 notifies the core so the closed session merges immediately", async () => {
+  const root = mkdtempSync(join(process.cwd(), ".simai-plugin-close-"));
+  const closeCalls = [];
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk; });
+    req.on("end", () => {
+      closeCalls.push({
+        url: req.url,
+        token: req.headers["x-simai-plugin-token"],
+        body: JSON.parse(raw || "{}"),
+      });
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ ok: true, processing: true }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await sodium.ready;
+    const keypair = sodium.crypto_box_keypair();
+    writeFileSync(join(root, "vault.header.json"), JSON.stringify({
+      format_version: 1,
+      sealed_inbox_public_key: Buffer.from(keypair.publicKey).toString("base64"),
+    }), { mode: 0o600 });
+    writeFileSync(join(root, "plugin.token"), "x".repeat(32), { mode: 0o600 });
+    const config = {
+      ...pluginConfig(root, join(root, "inbox.sock")),
+      coreUrl: `http://127.0.0.1:${server.address().port}`,
+    };
+    const runtime = mockApi(config);
+    plugin.register(runtime.api);
+    const receive = runtime.typedHooks.get("message_received");
+    const preprocess = runtime.internalHooks.get("message:preprocessed").handler;
+    const turn = async (content, id) => {
+      await receive(
+        { from: binding.senderKey, content, messageId: id, sessionKey: `sk-${id}` },
+        {
+          channelId: binding.channel,
+          accountId: binding.accountId,
+          conversationId: binding.conversationId,
+          senderId: binding.senderKey,
+          messageId: id,
+          sessionKey: `sk-${id}`,
+        },
+      );
+      await preprocess({
+        type: "message",
+        action: "preprocessed",
+        sessionKey: `sk-${id}`,
+        messages: [],
+        context: {
+          bodyForAgent: content,
+          from: binding.senderKey,
+          senderId: binding.senderKey,
+          channelId: binding.channel,
+          conversationId: binding.conversationId,
+          messageId: id,
+          isGroup: false,
+        },
+      });
+    };
+
+    await turn("开始记录", "c1");
+    await turn("速记中的一条想法", "c2");
+    await turn("结束记录", "c3");
+
+    const received = readEnvelopes(root, keypair);
+    const note = received.find((entry) => entry.body === "速记中的一条想法");
+    assert.equal(note.capture_mode, "explicit");
+    // Exactly one close notification, authenticated, naming the session that
+    // every sealed item of this dictation carries.
+    assert.equal(closeCalls.length, 1);
+    assert.equal(closeCalls[0].url, "/plugin-api/dictation/close");
+    assert.equal(closeCalls[0].token, "x".repeat(32));
+    assert.deepEqual(closeCalls[0].body, {
+      binding_id: binding.id,
+      dictation_id: note.dictation_id,
+    });
+  } finally {
+    server.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

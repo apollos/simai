@@ -902,6 +902,37 @@ def run(workdir: Path) -> None:
         and fallback_row is not None
         and "助手的插话" not in fallback_row["normalized_content"],
     )
+
+    # 结束记录 closes the session explicitly: closed sessions bypass the
+    # cutoff quiet window entirely; unclosed young sessions wait as a whole.
+    from simai.core import dictation as dictation_mod
+
+    config.raw["daily_capture"]["cutoff_delay_minutes"] = 30
+    seal_dictation("刚说完就应该被整理的想法", "dict-11", "session-e")
+    seal_dictation("这一句也属于同一次速记", "dict-12", "session-e")
+    waiting = run_daily(state, FakeLLM())
+    ok(
+        "unclosed young session waits out the quiet window",
+        waiting["processed"] == 0 and waiting["candidates"] == 0,
+    )
+    dictation_mod.mark_closed(config.inbox_dir, "local_cli", "session-e")
+    closed_run = run_daily(state, FakeLLM())
+    closed_row = state.conn.execute(
+        """SELECT normalized_content FROM candidates
+           WHERE normalized_content LIKE '%刚说完就应该被整理的想法%' AND status = 'pending'"""
+    ).fetchone()
+    ok(
+        "closed session bypasses the cutoff and merges immediately",
+        closed_run["processed"] == 2
+        and closed_run["candidates"] == 1
+        and closed_row is not None
+        and "这一句也属于同一次速记" in closed_row["normalized_content"],
+    )
+    ok(
+        "fully processed session is forgotten by the closure registry",
+        ("local_cli", "session-e") not in dictation_mod.closed_keys(config.inbox_dir),
+    )
+    config.raw["daily_capture"]["cutoff_delay_minutes"] = 0
     config.raw["daily_capture"]["max_messages_per_run"] = 1
 
     print("legacy envelope without dictation_id still opens")

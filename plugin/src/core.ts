@@ -101,6 +101,16 @@ export class SimaiCoreClient {
     );
   }
 
+  /** 结束记录: the session is complete; the core may merge it immediately. */
+  closeDictation(bindingId: string, dictationId: string) {
+    return this.request<{ ok: boolean; processing?: boolean; locked?: boolean }>(
+      "POST",
+      "/plugin-api/dictation/close",
+      { binding_id: bindingId, dictation_id: dictationId },
+      10_000,
+    );
+  }
+
   runDaily(bindingId: string) {
     return this.request<{
       locked?: boolean;

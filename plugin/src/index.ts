@@ -259,8 +259,28 @@ function registerSimai(api: OpenClawPluginApi): void {
       return;
     }
     if (DRIVING_OFF.test(body)) {
+      const closingId = drivingMode.get(matched.bindingId);
       drivingMode.delete(matched.bindingId);
       api.logger.info(`simai: driving mode disabled binding=${matched.bindingId}`);
+      if (closingId) {
+        // The owner's 结束记录 is the authoritative end-of-session signal:
+        // notify the core so the merge runs now instead of after the daily
+        // cutoff quiet window. Any failure here is harmless - the core's
+        // quiet-window fallback still processes the session later.
+        try {
+          const res = await getCore().closeDictation(matched.bindingId, closingId);
+          api.logger.info(
+            `simai: dictation close notified binding=${matched.bindingId} ` +
+              `session=${closingId} ok=${res.ok}` +
+              (res.ok ? ` processing=${res.data?.processing === true}` : ""),
+          );
+        } catch {
+          api.logger.warn(
+            `simai: dictation close notify failed binding=${matched.bindingId}; ` +
+              "core will merge after the quiet window",
+          );
+        }
+      }
       return;
     }
 

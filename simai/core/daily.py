@@ -25,7 +25,7 @@ from ..crypto import sealed_inbox
 from ..db.engine import now_iso
 from ..llm.client import ModelError, OpenClawClient
 from ..llm.schemas import DailyExtractResult, DictationMergeResult
-from . import capture, ids
+from . import capture, dictation, ids
 from .state import AppState
 
 log = logging.getLogger("simai.daily")
@@ -130,7 +130,7 @@ def _run_daily_locked(state: AppState, client: OpenClawClient) -> dict:
         )
 
     cutoff = datetime.now(UTC) - timedelta(minutes=cutoff_minutes)
-    items: list[sealed_inbox.InboxItem] = []
+    opened: list[tuple[sealed_inbox.InboxItem, datetime]] = []
     undecryptable = 0
     refused_binding = 0
     bindings = {b.id: b for b in state.config.source_bindings() if b.enabled}
@@ -156,7 +156,28 @@ def _run_daily_locked(state: AppState, client: OpenClawClient) -> dict:
             # import it under a now-disabled source.
             refused_binding += 1
             continue
-        if captured <= cutoff:
+        opened.append((item, captured))
+
+    # Cutoff. Ordinary items wait out the quiet window so a conversation in
+    # progress is never split. Dictation sessions are session-atomic instead:
+    # a session the plugin reported CLOSED (结束记录) is complete by definition
+    # and bypasses the window entirely; an unclosed session (plugin restart,
+    # lost close message) is processed only once ALL of its items are quiet,
+    # so a long session can never be merged in halves.
+    closed_sessions = dictation.closed_keys(state.config.inbox_dir)
+    session_latest: dict[tuple[str, str], datetime] = {}
+    for item, captured in opened:
+        if item.capture_mode == "explicit" and item.dictation_id:
+            key = (item.binding_id, item.dictation_id)
+            if key not in session_latest or captured > session_latest[key]:
+                session_latest[key] = captured
+    items: list[sealed_inbox.InboxItem] = []
+    for item, captured in opened:
+        if item.capture_mode == "explicit" and item.dictation_id:
+            key = (item.binding_id, item.dictation_id)
+            if key in closed_sessions or session_latest[key] <= cutoff:
+                items.append(item)
+        elif captured <= cutoff:
             items.append(item)
 
     # Deduplicate: drop items already receipted (explicitly handled or
@@ -217,6 +238,14 @@ def _run_daily_locked(state: AppState, client: OpenClawClient) -> dict:
     grouped_fingerprints = {
         fingerprint for members in dictation_groups.values() for _item, fingerprint in members
     }
+    # Sessions whose pending items ALL made it into this batch: only these may
+    # be forgotten by the closure registry afterwards, so a session split by
+    # the batch limit keeps its cutoff exemption for the follow-up run.
+    full_session_counts: dict[tuple[str, str], int] = {}
+    for item, _fingerprint in pending_by_fingerprint.values():
+        if item.capture_mode == "explicit" and item.dictation_id:
+            key = (item.binding_id, item.dictation_id)
+            full_session_counts[key] = full_session_counts.get(key, 0) + 1
 
     candidates_created = 0
     rechecked_done = 0
@@ -363,6 +392,14 @@ def _run_daily_locked(state: AppState, client: OpenClawClient) -> dict:
         sealed_inbox.delete_item(item.path)
     for item in already_done:
         sealed_inbox.delete_item(item.path)
+    dictation.discard(
+        state.config.inbox_dir,
+        {
+            key
+            for key, members in dictation_groups.items()
+            if len(members) == full_session_counts.get(key, 0)
+        },
+    )
 
     # snoozed -> pending: the daily reminder gathers everything left to review
     # (sections 4.2 / 12.3)

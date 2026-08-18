@@ -24,6 +24,7 @@ from ..core import (
     candidates,
     capture,
     daily,
+    dictation,
     export,
     qa,
     relations,
@@ -155,6 +156,11 @@ class ToolSearchBody(BaseModel):
 
 class ToolDailyBody(BaseModel):
     binding_id: str
+
+
+class ToolDictationCloseBody(BaseModel):
+    binding_id: str
+    dictation_id: str = Field(min_length=1, max_length=128)
 
 
 def create_app(config: Config, state: AppState | None = None) -> FastAPI:
@@ -748,6 +754,31 @@ def create_app(config: Config, state: AppState | None = None) -> FastAPI:
         locked=true without processing (cursor untouched)."""
         _plugin_binding(body.binding_id)
         return daily.run_daily(vault, app.state.llm)
+
+    @app.post("/plugin-api/dictation/close", dependencies=plugin_auth)
+    def tool_dictation_close(body: ToolDictationCloseBody):
+        """结束记录 arrived: the session is complete by the owner's own words.
+        Persist the closure (so it survives restarts and a locked vault) and,
+        when unlocked, merge the session right away instead of waiting out
+        the cutoff quiet window."""
+        _plugin_binding(body.binding_id)
+        try:
+            dictation.mark_closed(config.inbox_dir, body.binding_id, body.dictation_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
+        if not vault.is_unlocked:
+            # The unlock-time backlog run will pick the closed session up.
+            return {"ok": True, "processing": False, "locked": True}
+
+        def _merge_now() -> None:
+            try:
+                daily.run_daily(vault, app.state.llm)
+            except Exception:
+                # run_daily already logs; the session stays sealed for retry.
+                log.warning("dictation close: immediate merge run failed")
+
+        threading.Thread(target=_merge_now, name="simai-dictation-merge", daemon=True).start()
+        return {"ok": True, "processing": True}
 
     return app
 
