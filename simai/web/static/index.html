@@ -833,12 +833,37 @@ function guard(fn) {
     }
   };
 }
-["doInit", "doUnlock", "doLock", "doCapture", "confirmCand", "rejectCand", "snoozeCand",
- "batchCandidates", "promptNewRoot", "loadTree", "saveNode", "moveNodePrompt", "archiveNode",
- "restoreRev", "setRel", "loadGraph", "doSearch", "doQuery", "runDaily", "checkModels",
- "doBackup", "doExport", "addDictionaryTerm", "removeDictionaryTerm",
- "confirmMergeCand", "reorganizeNode"
+// 待确认箱的确认/拒绝/暂缓/合并共享一把锁：任一操作进行中时，页内其余
+// 操作按钮、类型下拉与复选框全部真实置灰（而不是看着可点、点了没反应），
+// 被点中的按钮显示旋转动画；操作结束（成功刷新或失败）后统一恢复。
+let _inboxBusy = false;
+function setInboxControlsDisabled(disabled) {
+  document.querySelectorAll(
+    "#view-inbox button, #view-inbox select, #view-inbox input[type=checkbox]"
+  ).forEach(el => { el.disabled = disabled; });
+}
+function inboxGuard(fn) {
+  return async function (...args) {
+    if (_inboxBusy) return;
+    const btn = (_lastBtn && performance.now() - _lastBtnTime < 60) ? _lastBtn : null;
+    _inboxBusy = true;
+    setInboxControlsDisabled(true);
+    if (btn) btn.classList.add("busy");
+    try { return await fn.apply(this, args); }
+    finally {
+      _inboxBusy = false;
+      if (btn) btn.classList.remove("busy");
+      setInboxControlsDisabled(false);
+    }
+  };
+}
+["doInit", "doUnlock", "doLock", "doCapture", "promptNewRoot", "loadTree", "saveNode",
+ "moveNodePrompt", "archiveNode", "restoreRev", "setRel", "loadGraph", "doSearch",
+ "doQuery", "runDaily", "checkModels", "doBackup", "doExport", "addDictionaryTerm",
+ "removeDictionaryTerm", "reorganizeNode"
 ].forEach(n => { window[n] = guard(window[n]); });
+["confirmCand", "rejectCand", "snoozeCand", "batchCandidates", "confirmMergeCand"
+].forEach(n => { window[n] = inboxGuard(window[n]); });
 
 boot();
 </script>
