@@ -1015,6 +1015,10 @@ def run(workdir: Path) -> None:
         "reorganize relation lands as ai_generated for review",
         reorg_rel["state"] == "ai_generated" and reorg_rel["origin"] == "ai",
     )
+    ok(
+        "pending AI relations are listable for the inbox",
+        any(r["model_profile"] == "reorganize" for r in relations.pending_ai(state.conn)),
+    )
     with state.transaction() as tx:
         candidates.confirm_candidate(
             tx,
@@ -1031,6 +1035,33 @@ def run(workdir: Path) -> None:
     ok(
         "confirmed merge appends source into target and retires the source",
         merged_source_state == "merged" and "产品加密应当默认开启" in merged_target_body,
+    )
+
+    print("deep reorganize")
+    # Exhaust the deep scan (per-run budget may defer scopes on a big tree).
+    for _ in range(5):
+        with state.transaction() as tx:
+            deep1 = reorganize_mod.reorganize_tree(
+                tx, FakeLLM(), keys.audit_hmac_key, keys.excerpt_key
+            )
+        if deep1["deferred"] == 0:
+            break
+    ok("deep scan analyzes changed scopes without failures", deep1["failed"] == 0)
+    with state.transaction() as tx:
+        deep2 = reorganize_mod.reorganize_tree(tx, FakeLLM(), keys.audit_hmac_key, keys.excerpt_key)
+    ok(
+        "unchanged scopes are skipped on the next deep scan",
+        deep2["scopes_run"] == 0 and deep2["skipped_unchanged"] == deep2["scopes_total"],
+    )
+    with state.transaction() as tx:
+        tree.update_node(
+            tx, keys.audit_hmac_key, merge_endpoints[1], "revise", body="合并后再补充一次修订"
+        )
+    with state.transaction() as tx:
+        deep3 = reorganize_mod.reorganize_tree(tx, FakeLLM(), keys.audit_hmac_key, keys.excerpt_key)
+    ok(
+        "a subtree update re-arms the deep scan for its parent scope",
+        deep3["scopes_run"] >= 1,
     )
 
     print("export")

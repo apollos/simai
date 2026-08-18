@@ -15,11 +15,16 @@ from __future__ import annotations
 
 import logging
 
-from ..llm.client import OpenClawClient
+from ..db.engine import now_iso
+from ..llm.client import ModelError, OpenClawClient
 from ..llm.schemas import ReorganizeResult
 from . import candidates, relations, tree
 
 log = logging.getLogger("simai.reorganize")
+
+# meta-table watermark per analyzed scope ("<top>" or a node id): the deep
+# scan re-analyzes a scope only when some descendant changed afterwards.
+MARK_PREFIX = "reorganize_mark:"
 
 REORGANIZE_SYSTEM = """You reorganise ONE level of the owner's private thought tree.
 You receive a parent topic and its direct children (id, type, title, body
@@ -139,6 +144,7 @@ def reorganize_children(
             continue
         relation_count += 1
 
+    _set_mark(conn, node_id)
     log.info(
         "reorganize done node=%s children=%d merges=%d relations=%d skipped=%d",
         node_id or "<top>",
@@ -153,3 +159,104 @@ def reorganize_children(
         "relation_proposals": relation_count,
         "skipped_invalid": skipped_invalid,
     }
+
+
+def reorganize_tree(
+    conn,
+    client: OpenClawClient,
+    audit_key: bytes,
+    excerpt_key: bytes,
+    max_parents: int = 8,
+) -> dict:
+    """Deep scan: analyze every parent (top level included) with >=2 active
+    children whose subtree changed since that parent's last reorganize pass.
+
+    At most `max_parents` model calls per invocation; remaining eligible
+    scopes are reported as deferred so the owner can simply run it again.
+    A model failure on one scope never aborts the others.
+    """
+    rows = conn.execute(
+        "SELECT id, parent_id, updated_at FROM nodes WHERE state = 'active'"
+    ).fetchall()
+    children_map: dict[str | None, list[str]] = {}
+    updated: dict[str, str] = {}
+    for row in rows:
+        children_map.setdefault(row["parent_id"], []).append(row["id"])
+        updated[row["id"]] = row["updated_at"]
+
+    subtree_latest: dict[str, str] = {}
+
+    def latest(node_id: str) -> str:
+        cached = subtree_latest.get(node_id)
+        if cached is None:
+            cached = max(
+                [updated[node_id]] + [latest(child) for child in children_map.get(node_id, [])]
+            )
+            subtree_latest[node_id] = cached
+        return cached
+
+    eligible: list[tuple[str, str | None]] = []
+    skipped_unchanged = 0
+    scopes_total = 0
+    for parent, kids in children_map.items():
+        if len(kids) < 2:
+            continue
+        scopes_total += 1
+        watermark = max(latest(kid) for kid in kids)
+        mark = _get_mark(conn, parent)
+        if mark and watermark <= mark:
+            skipped_unchanged += 1
+            continue
+        eligible.append((watermark, parent))
+
+    # Freshest changes first: the scopes the owner just touched get analyzed
+    # before older backlog when the per-run budget bites.
+    eligible.sort(key=lambda pair: pair[0], reverse=True)
+    deferred = max(0, len(eligible) - max_parents)
+    merge_candidates = 0
+    relation_proposals = 0
+    scopes_run = 0
+    failed = 0
+    for _watermark, scope in eligible[:max_parents]:
+        try:
+            summary = reorganize_children(conn, client, audit_key, excerpt_key, scope)
+        except ModelError:
+            failed += 1
+            log.warning("deep reorganize: model failed for scope %s", scope or "<top>")
+            continue
+        merge_candidates += summary.get("merge_candidates", 0)
+        relation_proposals += summary.get("relation_proposals", 0)
+        scopes_run += 1
+    log.info(
+        "deep reorganize done scopes=%d run=%d unchanged=%d deferred=%d failed=%d",
+        scopes_total,
+        scopes_run,
+        skipped_unchanged,
+        deferred,
+        failed,
+    )
+    return {
+        "scopes_total": scopes_total,
+        "scopes_run": scopes_run,
+        "skipped_unchanged": skipped_unchanged,
+        "deferred": deferred,
+        "failed": failed,
+        "merge_candidates": merge_candidates,
+        "relation_proposals": relation_proposals,
+    }
+
+
+def _mark_key(node_id: str | None) -> str:
+    return MARK_PREFIX + (node_id or "<top>")
+
+
+def _get_mark(conn, node_id: str | None) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (_mark_key(node_id),)).fetchone()
+    return row["value"] if row else None
+
+
+def _set_mark(conn, node_id: str | None) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+        (_mark_key(node_id), now_iso()),
+    )

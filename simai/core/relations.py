@@ -199,6 +199,23 @@ def set_relation_state(conn, audit_key: bytes, relation_id: str, new_state: str)
     return relation_id
 
 
+def pending_ai(conn, limit: int = 200) -> list[dict]:
+    """All ai_generated relations awaiting the owner's confirm/reject,
+    newest first. Shown in the confirmation inbox next to candidates."""
+    rows = conn.execute(
+        """SELECT r.id, r.from_node_id, r.to_node_id, r.relation_type, r.rationale,
+                  r.confidence, r.model_profile, r.valid_from,
+                  nf.title AS from_title, nt.title AS to_title
+           FROM relations r
+           JOIN nodes nf ON nf.id = r.from_node_id
+           JOIN nodes nt ON nt.id = r.to_node_id
+           WHERE r.state = 'ai_generated'
+           ORDER BY r.valid_from DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def relations_of(conn, node_id: str, include_stale: bool = False) -> list[dict]:
     states = ("ai_generated", "confirmed", "stale") if include_stale else ("ai_generated", "confirmed")
     marks = ",".join("?" * len(states))

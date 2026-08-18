@@ -459,7 +459,24 @@ def create_app(config: Config, state: AppState | None = None) -> FastAPI:
         except tree.TreeError as exc:
             raise HTTPException(404, str(exc))
 
+    @app.post("/api/tree/reorganize/deep", dependencies=[Depends(require_session)])
+    def reorganize_deep():
+        """Deep scan of the whole tree: every parent with >=2 children whose
+        subtree changed since its last pass gets one reorganize analysis,
+        bounded per invocation. Proposals only; nothing is auto-applied."""
+        with vault.transaction() as tx:
+            keys = vault.keys
+            return reorganize.reorganize_tree(
+                tx, app.state.llm, keys.audit_hmac_key, keys.excerpt_key
+            )
+
     # -- relations ------------------------------------------------------------------
+    @app.get("/api/relations/pending", dependencies=[Depends(require_session)])
+    async def pending_relations():
+        """ai_generated relations awaiting review, for the confirmation inbox."""
+        with vault.reading() as conn:
+            return {"relations": relations.pending_ai(conn)}
+
     @app.get("/api/relations/graph", dependencies=[Depends(require_session)])
     async def relation_graph(node_id: str, depth: int = 1):
         try:

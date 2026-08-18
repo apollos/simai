@@ -192,7 +192,7 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
         <h2 style="margin:0">思维树</h2>
         <div class="row">
           <button class="small" onclick="promptNewRoot()">新建一级主题</button>
-          <button class="ghost small" onclick="reorganizeNode(null)" title="用整理模型分析一级主题，生成合并建议与关系提案（需确认后生效）">AI 整理一级主题</button>
+          <button class="ghost small" onclick="reorganizeDeep()" title="深度扫描全树：凡子节点≥2 且自上次整理后子树有变更的层级都做一次合并/关系分析（每轮有上限，结果需确认后生效）">AI 深度整理全树</button>
           <button class="ghost small" onclick="loadTree()">刷新</button>
         </div>
       </div>
@@ -416,11 +416,20 @@ async function doCapture(useModel) {
 }
 async function loadInbox() {
   try {
-    const [d, treeData] = await Promise.all([api("/api/candidates"), api("/api/tree")]);
+    const [d, treeData, rel] = await Promise.all([
+      api("/api/candidates"), api("/api/tree"), api("/api/relations/pending"),
+    ]);
     const allParents = treeData.nodes.map(n =>
       `<option value="${n.id}">${esc(n.title)} (${esc(n.id)})</option>`).join("");
-    $("#pendingBadge").textContent = d.candidates.length;
-    if (!d.candidates.length) { $("#inboxList").innerHTML = '<p class="muted">没有待确认的候选。</p>'; return; }
+    const pendingRelations = rel.relations || [];
+    $("#pendingBadge").textContent = d.candidates.length + pendingRelations.length;
+    const relationSection = pendingRelations.length ? `
+      <h2 style="margin-top:18px">AI 关系待确认 <span class="muted">（整理模型建议的语义关系，确认后才生效）</span></h2>
+      ${pendingRelations.map(renderRelationCard).join("")}` : "";
+    if (!d.candidates.length) {
+      $("#inboxList").innerHTML = '<p class="muted">没有待确认的候选。</p>' + relationSection;
+      return;
+    }
     $("#inboxList").innerHTML = d.candidates.map(c => c.proposed_action === "merge" ? renderMergeCard(c) : `
       <div class="card" id="cand-${c.candidate_id}">
         <div class="row" style="justify-content:space-between">
@@ -458,8 +467,41 @@ async function loadInbox() {
           <button class="small ghost" onclick="snoozeCand('${c.candidate_id}')">暂缓</button>
           <button class="small danger" onclick="rejectCand('${c.candidate_id}')">拒绝</button>
         </div>
-      </div>`).join("");
+      </div>`).join("") + relationSection;
   } catch (e) { /* locked or session expired: handled globally */ }
+}
+function renderRelationCard(r) {
+  return `
+    <div class="card" id="rel-${r.id}">
+      <div class="row" style="justify-content:space-between">
+        <span><b>${esc(r.from_title)}</b> <span class="badge warn">${esc(r.relation_type)}</span> <b>${esc(r.to_title)}</b></span>
+        <span><span class="badge">AI 关系</span>${r.confidence != null ? ` <span class="muted">置信 ${Math.round(r.confidence * 100)}%</span>` : ""}</span>
+      </div>
+      ${r.rationale ? `<div class="excerpt">${esc(r.rationale)}</div>` : ""}
+      <div class="actions">
+        <button class="small" onclick="decideRelation('${r.id}','confirmed')">确认关系</button>
+        <button class="small danger" onclick="decideRelation('${r.id}','rejected')">否决</button>
+      </div>
+    </div>`;
+}
+async function decideRelation(id, state) {
+  try {
+    await api(`/api/relations/${id}/state`, { method: "POST", body: { state } });
+    toast(state === "confirmed" ? "关系已确认" : "关系已否决");
+    loadInbox(); loadTree();
+  } catch (e) { toast("操作失败：" + e.message, 6000); }
+}
+async function reorganizeDeep() {
+  try {
+    toast("正在深度扫描全树（仅重新分析有变更的层级），请稍候…", 10000);
+    const d = await api("/api/tree/reorganize/deep", { method: "POST" });
+    const parts = [`分析了 ${d.scopes_run} 个层级（共 ${d.scopes_total} 个，${d.skipped_unchanged} 个自上次整理后无变更）`];
+    parts.push(`${d.merge_candidates} 条合并建议、${d.relation_proposals} 条 AI 关系已进入待确认箱`);
+    if (d.deferred) parts.push(`还有 ${d.deferred} 个层级超出本轮上限，再点一次继续`);
+    if (d.failed) parts.push(`${d.failed} 个层级模型分析失败，可重试`);
+    toast(parts.join("；"), 12000);
+    loadInbox(); loadTree();
+  } catch (e) { toast("深度整理失败：" + e.message, 8000); }
 }
 function renderMergeCard(c) {
   // AI reorganize proposal: append source node's content into target node.
@@ -497,7 +539,7 @@ async function reorganizeNode(id) {
     toast("正在用整理模型分析子节点，请稍候…", 8000);
     const d = await api("/api/tree/reorganize", { method: "POST", body: { node_id: id } });
     if (d.skipped) { toast("未整理：" + d.skipped, 6000); return; }
-    toast(`整理完成：${d.merge_candidates} 条合并建议已进入待确认箱，${d.relation_proposals} 条 AI 关系待确认`, 8000);
+    toast(`整理完成：${d.merge_candidates} 条合并建议与 ${d.relation_proposals} 条 AI 关系已进入待确认箱`, 8000);
     loadInbox();
     if (id) openNode(id); else loadTree();
   } catch (e) { toast("整理失败：" + e.message, 8000); }
@@ -524,8 +566,8 @@ async function confirmCand(id) {
     loadInbox(); loadTree();
   } catch (e) { toast("确认失败：" + e.message, 6000); }
 }
-async function rejectCand(id) { await api(`/api/candidates/${id}/reject`, { method: "POST" }); loadInbox(); }
-async function snoozeCand(id) { await api(`/api/candidates/${id}/snooze`, { method: "POST" }); loadInbox(); }
+async function rejectCand(id) { await api(`/api/candidates/${id}/reject`, { method: "POST" }); loadInbox(); loadTree(); }
+async function snoozeCand(id) { await api(`/api/candidates/${id}/snooze`, { method: "POST" }); loadInbox(); loadTree(); }
 async function batchCandidates(action) {
   const ids = [...document.querySelectorAll(".candidate-select:checked")].map(x => x.value);
   if (!ids.length) { toast("请先选择候选"); return; }
@@ -550,18 +592,44 @@ async function batchCandidates(action) {
 let treeNodes = [];
 async function loadTree() {
   try {
-    const d = await api("/api/tree");
+    const [d, cand, rel] = await Promise.all([
+      api("/api/tree"),
+      api("/api/candidates").catch(() => ({ candidates: [] })),
+      api("/api/relations/pending").catch(() => ({ relations: [] })),
+    ]);
     treeNodes = d.nodes;
+    // 每个节点身上的待确认数：涉及它的 AI 关系提案 + 引用它的合并建议。
+    const pendingByNode = {};
+    const bump = id => { if (id) pendingByNode[id] = (pendingByNode[id] || 0) + 1; };
+    (rel.relations || []).forEach(r => { bump(r.from_node_id); bump(r.to_node_id); });
+    (cand.candidates || []).forEach(c => {
+      if (c.proposed_action === "merge") (c.proposed_parents || []).forEach(p => bump(p.node_id));
+    });
     const byParent = {};
     d.nodes.forEach(n => { (byParent[n.parent_id ?? "ROOT"] ||= []).push(n); });
+    // 分支合计（含更深层级）：折叠状态下也能看出下面有待确认内容。
+    const subtreePending = {};
+    function countSubtree(id) {
+      let total = pendingByNode[id] || 0;
+      (byParent[id] || []).forEach(k => { total += countSubtree(k.id); });
+      subtreePending[id] = total;
+      return total;
+    }
+    (byParent["ROOT"] || []).forEach(n => countSubtree(n.id));
     function render(pid) {
       const kids = byParent[pid] || [];
       return kids.map(n => {
         const has = (byParent[n.id] || []).length > 0;
+        const own = pendingByNode[n.id] || 0;
+        const below = (subtreePending[n.id] || 0) - own;
+        const marks =
+          (own ? `<span class="badge warn" style="cursor:pointer" onclick="gotoView('inbox')" title="该节点有 ${own} 条待确认（合并建议 / AI 关系），点击去待确认箱处理">待确认 ${own}</span>` : "") +
+          (below ? `<span class="badge" style="cursor:pointer" onclick="gotoView('inbox')" title="下级节点还有 ${below} 条待确认，点击去待确认箱处理">↓ ${below}</span>` : "");
         return `<div class="tree-node">
           <div class="tree-row">
             <span class="toggle" onclick="toggleBranch(event,'${n.id}')">${has ? "▾" : "·"}</span>
             <span onclick="openNode('${n.id}')" style="flex:1">${esc(n.title)}</span>
+            ${marks}
             <span class="type">${esc(n.node_type)}</span>
             <span class="muted">${esc(n.id)}</span>
           </div>
@@ -860,9 +928,10 @@ function inboxGuard(fn) {
 ["doInit", "doUnlock", "doLock", "doCapture", "promptNewRoot", "loadTree", "saveNode",
  "moveNodePrompt", "archiveNode", "restoreRev", "setRel", "loadGraph", "doSearch",
  "doQuery", "runDaily", "checkModels", "doBackup", "doExport", "addDictionaryTerm",
- "removeDictionaryTerm", "reorganizeNode"
+ "removeDictionaryTerm", "reorganizeNode", "reorganizeDeep"
 ].forEach(n => { window[n] = guard(window[n]); });
-["confirmCand", "rejectCand", "snoozeCand", "batchCandidates", "confirmMergeCand"
+["confirmCand", "rejectCand", "snoozeCand", "batchCandidates", "confirmMergeCand",
+ "decideRelation"
 ].forEach(n => { window[n] = inboxGuard(window[n]); });
 
 boot();
