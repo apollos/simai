@@ -351,7 +351,9 @@ def _run_daily_locked(state: AppState, client: OpenClawClient) -> dict:
                 "UPDATE job_runs SET finished_at = ?, status = 'failed', error_kind = ? WHERE id = ?",
                 (now_iso(), type(exc).__name__, job),
             )
-        log.error("daily run failed: %s", type(exc).__name__)
+        # ModelError strings are content-free by contract (task name, HTTP
+        # status, parse/validation/truncation kind) and safe to log.
+        log.error("daily run failed: %s: %s", type(exc).__name__, exc)
         if not isinstance(exc, ModelError):
             raise  # unexpected bug: bookkeeping done, let the caller see it
         return {"locked": False, "processed": 0, "candidates": 0, "failed": True, "notify": False}

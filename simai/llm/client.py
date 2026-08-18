@@ -121,12 +121,17 @@ class OpenClawClient:
             raise ModelError(f"Gateway returned HTTP {r.status_code} for model {model}")
         try:
             data = r.json()
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
             used = data.get("model", model)
         except (KeyError, IndexError, ValueError) as exc:
             raise ModelError("Malformed gateway response") from exc
         if not isinstance(content, str):
             raise ModelError("Malformed gateway response: content is not text")
+        # A truncated reply is the classic source of "unparseable JSON": surface
+        # it as its own diagnosis instead of a downstream parse error.
+        if choice.get("finish_reason") == "length":
+            raise ModelError(f"Model reply truncated at max_tokens={max_tokens}")
         self.last_response_models[model] = str(used)
         log.info("model call ok task_model=%s used=%s", model, used)
         return content
@@ -138,19 +143,28 @@ class OpenClawClient:
             "\n\nRespond with a single JSON object only, no prose, matching this JSON schema:\n"
             + json.dumps(schema.model_json_schema(), ensure_ascii=False)
         )
-        raw = self._chat(
-            model,
-            [
-                {"role": "system", "content": system + prompt_suffix},
-                {"role": "user", "content": user},
-            ],
-            backend_model=self.task_models.get(task),
-        )
-        payload = _extract_json(raw)
         try:
+            raw = self._chat(
+                model,
+                [
+                    {"role": "system", "content": system + prompt_suffix},
+                    {"role": "user", "content": user},
+                ],
+                # Extraction tasks echo source excerpts verbatim, so the output
+                # scales with the input batch; a tight cap truncates the JSON.
+                max_tokens=8192,
+                backend_model=self.task_models.get(task),
+            )
+            payload = _extract_json(raw)
             return schema.model_validate(payload)
         except ValidationError as exc:
-            raise ModelError(f"Model output failed schema validation: {exc.error_count()} errors") from exc
+            raise ModelError(
+                f"task {task}: model output failed schema validation: {exc.error_count()} errors"
+            ) from exc
+        except ModelError as exc:
+            # Tag with the task so a failed daily run names its culprit. Error
+            # strings never contain message content.
+            raise ModelError(f"task {task}: {exc}") from exc
 
     def free_text(self, task: str, system: str, user: str) -> str:
         return self._chat(
